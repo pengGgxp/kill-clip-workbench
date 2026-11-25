@@ -10,9 +10,26 @@ import {
   writeFile,
 } from 'node:fs/promises';
 import path from 'node:path';
+import process from 'node:process';
 
-import ffprobe from '@ffprobe-installer/ffprobe';
-import ffmpeg from 'ffmpeg-static';
+const bundledTools =
+  process.platform === 'win32' && process.resourcesPath && !process.defaultApp
+    ? path.join(process.resourcesPath, 'media')
+    : undefined;
+const ffmpegPackage =
+  !bundledTools && !process.env.KILL_CLIP_FFMPEG
+    ? await import('ffmpeg-static')
+    : undefined;
+const ffprobePackage =
+  !bundledTools && !process.env.KILL_CLIP_FFPROBE
+    ? await import('@ffprobe-installer/ffprobe')
+    : undefined;
+const ffmpeg = bundledTools
+  ? path.join(bundledTools, 'ffmpeg.exe')
+  : process.env.KILL_CLIP_FFMPEG || ffmpegPackage?.default || 'ffmpeg';
+const ffprobe = bundledTools
+  ? path.join(bundledTools, 'ffprobe.exe')
+  : process.env.KILL_CLIP_FFPROBE || ffprobePackage?.default.path;
 
 export const videoExtensions = new Set([
   '.avi',
@@ -69,7 +86,7 @@ function run(executable, args, { signal, onProgress } = {}) {
 
 export function runFFmpeg(args, options) {
   return run(
-    process.env.KILL_CLIP_FFMPEG || ffmpeg || 'ffmpeg',
+    ffmpeg,
     ['-hide_banner', '-nostdin', '-loglevel', 'error', '-xerror', ...args],
     options,
   );
@@ -85,7 +102,7 @@ export async function probe(file, signal) {
   const identity = await fileIdentity(file);
   const data = JSON.parse(
     await run(
-      process.env.KILL_CLIP_FFPROBE || ffprobe.path,
+      ffprobe,
       [
         '-v',
         'error',

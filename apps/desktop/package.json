@@ -1,5 +1,6 @@
 {
   "name": "@kill-clip/desktop",
+  "version": "1.0.0",
   "productName": "Kill Clip Workbench",
   "private": true,
   "type": "module",
@@ -12,6 +13,7 @@
     "ffmpeg-static": "5.3.0"
   },
   "devDependencies": {
-    "electron": "45.5.0"
+    "electron": "45.5.0",
+    "electron-builder": "26.18.1"
   }
 }

@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { mkdir, mkdtemp, readdir, realpath, stat } from 'node:fs/promises';
 import path from 'node:path';
+import process from 'node:process';
 import { Readable } from 'node:stream';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -27,14 +28,18 @@ import {
   writeJson,
 } from './media.mjs';
 
-const ui = new URL(process.env.KILL_CLIP_DEV_URL || 'workbench://app/');
+const ui = new URL(
+  (!app.isPackaged && process.env.KILL_CLIP_DEV_URL) || 'workbench://app/',
+);
 if (
   ui.protocol !== 'workbench:' &&
   (ui.protocol !== 'http:' || ui.hostname !== '127.0.0.1')
 ) {
   throw new Error('KILL_CLIP_DEV_URL must use HTTP on 127.0.0.1');
 }
-const dist = fileURLToPath(new URL('../../web-antd/dist/', import.meta.url));
+const dist = app.isPackaged
+  ? path.join(process.resourcesPath, 'web') + path.sep
+  : fileURLToPath(new URL('../../web-antd/dist/', import.meta.url));
 const defaults = {
   preRollSeconds: 5,
   postRollSeconds: 5,

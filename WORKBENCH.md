@@ -2,7 +2,11 @@
 
 Windows 本地桌面应用。界面使用 Vben Admin v5 和 Ant Design Vue，桌面端用 Electron 调用 FFmpeg 与 FFprobe。需求见 [PRD.md](PRD.md)。
 
-## 启动
+## 安装与启动
+
+双击 `release/Kill-Clip-Workbench-Setup-1.0.0-x64.exe` 安装 Windows x64 版，再从开始菜单打开 **Kill Clip Workbench**。安装包内置 Electron、FFmpeg 和 FFprobe，不需要另装 Node.js 或启动网页服务。当前安装包未签名，Windows 可能提示发布者未知。
+
+## 从源码启动
 
 在项目目录使用 Node.js 24 和 pnpm 11，运行以下命令。
 
@@ -13,6 +17,8 @@ pnpm workbench
 ```
 
 首次启动会下载 Electron 运行时。下载失败时可按网络环境配置 `ELECTRON_MIRROR`，再执行 `pnpm workbench`。FFmpeg 和 FFprobe 由项目依赖提供。也可通过 `KILL_CLIP_FFMPEG`、`KILL_CLIP_FFPROBE` 指定本机可执行文件。
+
+在 Windows x64 上运行 `pnpm package:win` 可重新生成安装包。程序版本号在 `apps/desktop/package.json`，生成文件在 `release/`，不纳入 Git。
 
 ## 剪辑流程
 

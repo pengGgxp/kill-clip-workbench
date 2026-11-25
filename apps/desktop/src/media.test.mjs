@@ -1,11 +1,31 @@
+// @vitest-environment node
+
 import assert from 'node:assert/strict';
 import { mkdtemp, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+
 import { it } from 'vitest';
 
 import { buildClipPlan } from './clip-plan.mjs';
-import { fileIdentity, probe, renderVolume, runFFmpeg } from './media.mjs';
+import {
+  fileIdentity,
+  outputSize,
+  probe,
+  renderVolume,
+  runFFmpeg,
+} from './media.mjs';
+
+it('uses the first source clip dimensions for each volume in source mode', () => {
+  const volume = { clips: [{ videoId: 'second' }] };
+  const videos = [
+    { id: 'first', width: 1920, height: 1080 },
+    { id: 'second', width: 1440, height: 1080 },
+  ];
+  assert.deepEqual(outputSize('source', volume, videos), [1440, 1080]);
+  assert.deepEqual(outputSize('720p', volume, videos), [1280, 720]);
+  assert.throws(() => outputSize('source', volume, []), /无法确定输出尺寸/);
+});
 
 it('exports and fully verifies different video specifications within the volume limit', async () => {
   const folder = await mkdtemp(path.join(tmpdir(), 'kill-clip-test-'));
@@ -16,7 +36,7 @@ it('exports and fully verifies different video specifications within the volume 
       '-f',
       'lavfi',
       '-i',
-      'testsrc2=s=320x180:r=60',
+      'testsrc2=s=1440x1080:r=30',
       '-f',
       'lavfi',
       '-i',
@@ -57,10 +77,11 @@ it('exports and fully verifies different video specifications within the volume 
     });
     assert.equal(plan.volumes.length, 1);
     const progress = [];
+    const sourceSize = outputSize('source', plan.volumes[0], videos);
     const result = await renderVolume(
       plan.volumes[0],
       folder,
-      '720p',
+      sourceSize,
       4,
       new AbortController().signal,
       (percentage) => progress.push(percentage),
@@ -69,7 +90,7 @@ it('exports and fully verifies different video specifications within the volume 
     assert.equal(result.identity, await fileIdentity(result.path));
     assert.ok(progress.some((percentage) => percentage >= 92));
     const metadata = await probe(result.path);
-    assert.equal(metadata.width, 1280);
+    assert.deepEqual([metadata.width, metadata.height], [1440, 1080]);
     await Promise.all([stat(first), stat(second)]);
   } finally {
     await rm(folder, { recursive: true, force: true });

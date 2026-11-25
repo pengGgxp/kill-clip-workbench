@@ -18,6 +18,7 @@ import { Arch, build, Platform } from 'electron-builder';
 import ffmpeg from 'ffmpeg-static';
 
 import desktop from '../package.json' with { type: 'json' };
+import { prepareFlowBlur } from './setup-flowblur.mjs';
 
 if (process.platform !== 'win32' || process.arch !== 'x64') {
   throw new Error('The Windows x64 installer must be built on Windows x64.');
@@ -27,6 +28,7 @@ const root = fileURLToPath(new URL('../../../', import.meta.url));
 const require = createRequire(import.meta.url);
 const web = path.join(root, 'apps', 'web-antd', 'dist');
 const electronDist = path.dirname(electron);
+const flowBlur = await prepareFlowBlur();
 await Promise.all([
   access(path.join(web, 'index.html')),
   access(electron),
@@ -85,6 +87,15 @@ try {
         { from: web, to: 'web' },
         { from: ffmpeg, to: 'media/ffmpeg.exe' },
         { from: ffprobe.path, to: 'media/ffprobe.exe' },
+        {
+          from: flowBlur,
+          to: 'media/flowblur',
+          filter: ['**/*', '!**/*.pdb', '!**/__pycache__/**', '!**/include/**'],
+        },
+        {
+          from: fileURLToPath(new URL('../src/flowblur.py', import.meta.url)),
+          to: 'media/flowblur/flowblur.py',
+        },
         { from: licenses, to: 'licenses' },
       ],
       win: {

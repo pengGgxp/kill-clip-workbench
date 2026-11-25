@@ -18,8 +18,10 @@ import {
 
 import { buildClipPlan } from './clip-plan.mjs';
 import {
+  checkFlowBlur,
   ensureSpace,
   fileIdentity,
+  outputSize,
   probe,
   readJson,
   renderVolume,
@@ -45,12 +47,14 @@ const defaults = {
   postRollSeconds: 5,
   mergeGapSeconds: 8,
   maxVolumeHours: 1,
-  resolution: '1080p',
+  motionBlur: false,
+  resolution: 'source',
 };
 const channels = 'workbench:';
 let window;
 let project;
 let projectFile;
+let saveState = { status: 'unsaved' };
 let job;
 let lastExport;
 let receipt;
@@ -148,8 +152,13 @@ function validatedSettings(raw) {
     )
       throw new Error('剪辑设置超出有效范围');
   }
-  if (!Object.hasOwn(resolutions, settings.resolution))
+  if (
+    settings.resolution !== 'source' &&
+    !Object.hasOwn(resolutions, settings.resolution)
+  )
     throw new Error('输出规格无效');
+  if (typeof settings.motionBlur !== 'boolean')
+    throw new Error('运动模糊设置无效');
   return Object.fromEntries(
     Object.keys(defaults).map((key) => [key, settings[key]]),
   );
@@ -184,14 +193,59 @@ function serialize(operation) {
   return next;
 }
 
+function recoveryFile() {
+  return path.join(app.getPath('userData'), 'current-project.json');
+}
+
+function setSaveState(status, detail) {
+  saveState = { status, detail };
+  if (window && !window.isDestroyed())
+    window.webContents.send(`${channels}save-state`, saveState);
+}
+
 async function persist() {
-  project.updatedAt = new Date().toISOString();
-  const data = projectData();
-  await writeJson(path.join(app.getPath('userData'), 'current-project.json'), {
-    projectFile,
-    data,
-  });
-  if (projectFile) await writeJson(projectFile, data);
+  setSaveState('saving');
+  try {
+    project.updatedAt = new Date().toISOString();
+    const data = projectData();
+    await writeJson(recoveryFile(), { projectFile, data });
+    if (projectFile) await writeJson(projectFile, data);
+    setSaveState('saved');
+  } catch (error) {
+    setSaveState('save-failed', error.message);
+    throw error;
+  }
+}
+
+async function restoreProject() {
+  let stored;
+  try {
+    stored = await readJson(recoveryFile());
+  } catch (error) {
+    if (error.code === 'ENOENT') return;
+    setSaveState('restore-failed', error.message);
+    return;
+  }
+  try {
+    await hydrate(stored.data, stored.projectFile);
+  } catch (error) {
+    setSaveState('restore-failed', error.message);
+    return;
+  }
+  if (projectFile) {
+    try {
+      const saved = await readJson(projectFile);
+      if (
+        saved.createdAt !== stored.data.createdAt ||
+        saved.updatedAt !== stored.data.updatedAt
+      )
+        throw new Error('项目文件与自动恢复副本不同步');
+    } catch (error) {
+      setSaveState('save-failed', error.message);
+      return;
+    }
+  }
+  setSaveState('saved');
 }
 
 async function hydrate(data, file) {
@@ -208,7 +262,7 @@ async function hydrate(data, file) {
   for (const video of data.videos) {
     videos.push(await describeVideo(video.path, validatedMarks(video.marks)));
   }
-  project = {
+  const restored = {
     ...newProject(data.name),
     settings,
     videos,
@@ -249,8 +303,9 @@ async function hydrate(data, file) {
       }
       volumes.push({ ...saved, path: output, url: registerMedia(output) });
     }
-    project.result = { ...savedResult, volumes };
+    restored.result = { ...savedResult, volumes };
   }
+  project = restored;
   projectFile = file;
   receipt = undefined;
 }
@@ -262,12 +317,39 @@ function samePath(a, b) {
 }
 
 async function importVideos(paths) {
-  for (const file of paths.filter((item) => localVideo(item))) {
+  const files = paths.filter((item) => localVideo(item));
+  if (files.length === 0) return project;
+  const previousCount = project.videos.length;
+  let completed = 0;
+  let lastProgressAt = Date.now();
+  if (files.length > 0) {
+    sendImportProgress({
+      completed,
+      total: files.length,
+      current: path.basename(files[0]),
+    });
+  }
+  for (const file of files) {
     const video = await describeVideo(file);
     if (!project.videos.some((entry) => samePath(entry.path, video.path)))
       project.videos.push(video);
+    completed += 1;
+    const now = Date.now();
+    if (
+      completed === files.length ||
+      completed % 10 === 0 ||
+      now - lastProgressAt >= 1000
+    ) {
+      sendImportProgress({
+        completed,
+        total: files.length,
+        current:
+          completed < files.length ? path.basename(files[completed]) : '',
+      });
+      lastProgressAt = now;
+    }
   }
-  await persist();
+  if (project.videos.length !== previousCount) await persist();
   return project;
 }
 
@@ -290,6 +372,11 @@ function sendJob(state) {
     window.webContents.send(`${channels}progress`, state);
 }
 
+function sendImportProgress(state) {
+  if (window && !window.isDestroyed())
+    window.webContents.send(`${channels}import-progress`, state);
+}
+
 async function exportProject() {
   const snapshot = structuredClone(project);
   const plan = buildClipPlan(snapshot.videos, snapshot.settings);
@@ -299,13 +386,22 @@ async function exportProject() {
   )
     throw new Error('请先修正剪辑计划');
   if (!project.outputDirectory) throw new Error('请先选择输出目录');
+  if (snapshot.settings.motionBlur) await checkFlowBlur();
   const limit = snapshot.settings.maxVolumeHours * 3600;
   const folderRoot = await realpath(snapshot.outputDirectory);
+  const outputSizes = plan.volumes.map((volume) =>
+    outputSize(snapshot.settings.resolution, volume, snapshot.videos),
+  );
+  let maxOutputSize = outputSizes[0];
+  for (const size of outputSizes.slice(1)) {
+    if (size[0] * size[1] > maxOutputSize[0] * maxOutputSize[1])
+      maxOutputSize = size;
+  }
   await ensureSpace(
     folderRoot,
     plan.totalSeconds,
     Math.max(...plan.volumes.map(({ duration }) => duration)),
-    snapshot.settings.resolution,
+    maxOutputSize,
   );
   const folder = await mkdtemp(
     path.join(folderRoot, `kills-${new Date().toISOString().slice(0, 10)}-`),
@@ -314,12 +410,14 @@ async function exportProject() {
   const result = {
     folder,
     report: path.join(folder, 'export-report.json'),
-    volumes: plan.volumes.map(({ number, duration }) => ({
+    volumes: plan.volumes.map(({ number, duration }, index) => ({
       number,
       duration,
       status: 'waiting',
       percent: 0,
       detail: '',
+      width: outputSizes[index][0],
+      height: outputSizes[index][1],
     })),
   };
   project.result = result;
@@ -348,16 +446,19 @@ async function exportProject() {
         const output = await renderVolume(
           volume,
           folder,
-          snapshot.settings.resolution,
+          outputSizes[index],
           limit,
           controller.signal,
           (percent, detail) => {
             Object.assign(state, { percent, detail });
             sendJob(result);
           },
+          { motionBlur: snapshot.settings.motionBlur },
         );
         Object.assign(state, output, {
           status: 'success',
+          width: outputSizes[index][0],
+          height: outputSizes[index][1],
           percent: 100,
           detail: '校验通过',
           url: registerMedia(output.path),
@@ -526,15 +627,7 @@ async function start() {
   await app.whenReady();
   await mkdir(app.getPath('userData'), { recursive: true });
   project = newProject();
-  try {
-    const stored = await readJson(
-      path.join(app.getPath('userData'), 'current-project.json'),
-    );
-    await hydrate(stored.data, stored.projectFile);
-  } catch (error) {
-    if (error.code !== 'ENOENT')
-      console.error('Project restore:', error.message);
-  }
+  await restoreProject();
   protocol.handle('clip-media', serveMedia);
   protocol.handle('workbench', async (request) => {
     const url = new URL(request.url);
@@ -566,6 +659,7 @@ async function start() {
   handle('project', () => ({
     project,
     projectFile,
+    saveState,
     cleanup: receipt?.sources ?? [],
   }));
   handle(
@@ -617,6 +711,7 @@ async function start() {
     },
     { mutable: true },
   );
+  handle('retry-save', persist, { mutable: true });
   handle(
     'update',
     async ({ settings, marks, remove }) => {

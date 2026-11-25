@@ -12,7 +12,8 @@ export interface Video extends VideoForPlan {
 }
 
 export interface Settings extends ClipSettings {
-  resolution: '1080p' | '720p';
+  motionBlur: boolean;
+  resolution: '720p' | '1080p' | 'source';
 }
 
 export interface RenderResult {
@@ -21,10 +22,12 @@ export interface RenderResult {
   volumes: {
     number: number;
     duration: number;
-    status: 'waiting' | 'running' | 'success' | 'failed' | 'cancelled';
+    status: 'cancelled' | 'failed' | 'running' | 'success' | 'waiting';
     percent: number;
     detail: string;
     name?: string;
+    width?: number;
+    height?: number;
     url?: string;
   }[];
 }
@@ -34,16 +37,28 @@ export interface Project {
   videos: Video[];
   settings: Settings;
   outputDirectory: string;
-  result: RenderResult | null;
+  result: null | RenderResult;
 }
 
 type ProjectState = { project: Project; projectFile?: string };
 
+export interface SaveState {
+  status: 'restore-failed' | 'save-failed' | 'saved' | 'saving' | 'unsaved';
+  detail?: string;
+}
+
+export interface ImportProgress {
+  completed: number;
+  current: string;
+  total: number;
+}
+
 interface Desktop {
-  project(): Promise<ProjectState & { cleanup: Video[] }>;
+  project(): Promise<ProjectState & { cleanup: Video[]; saveState: SaveState }>;
   newProject(name: string): Promise<ProjectState>;
-  openProject(): Promise<ProjectState | null>;
+  openProject(): Promise<null | ProjectState>;
   saveProject(): Promise<null | string>;
+  retrySave(): Promise<void>;
   update(data: {
     settings?: Settings;
     marks?: { id: string; values: number[] };
@@ -63,7 +78,9 @@ interface Desktop {
     recycled: string[];
     errors: string[];
   }>;
+  onImportProgress(callback: (progress: ImportProgress) => void): () => void;
   onProgress(callback: (state: RenderResult) => void): () => void;
+  onSaveState(callback: (state: SaveState) => void): () => void;
 }
 
 export const desktop = (window as Window & { clipWorkbench?: Desktop })
@@ -73,5 +90,6 @@ export const initialSettings: Settings = {
   postRollSeconds: 5,
   mergeGapSeconds: 8,
   maxVolumeHours: 1,
-  resolution: '1080p',
+  motionBlur: false,
+  resolution: 'source',
 };

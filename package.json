@@ -1,27 +1,24 @@
 {
   "name": "kill-clip-workbench",
-  "version": "5.7.0",
+  "version": "1.1.0",
   "private": true,
   "keywords": [
-    "monorepo",
-    "turbo",
-    "vben",
-    "vben admin",
-    "vben pro",
+    "fps",
+    "gameplay",
+    "clip editor",
+    "video editing",
+    "electron",
+    "ffmpeg",
     "vue",
-    "vue admin",
-    "vue vben admin",
-    "vue vben admin pro",
-    "vue3"
+    "vue3",
+    "typescript"
   ],
-  "homepage": "https://github.com/vbenjs/vue-vben-admin",
-  "bugs": "https://github.com/vbenjs/vue-vben-admin/issues",
-  "repository": "vbenjs/vue-vben-admin.git",
+  "homepage": "https://github.com/pengGgxp/kill-clip-workbench",
+  "bugs": "https://github.com/pengGgxp/kill-clip-workbench/issues",
+  "repository": "pengGgxp/kill-clip-workbench.git",
   "license": "MIT",
   "author": {
-    "name": "vben",
-    "email": "ann.vben@gmail.com",
-    "url": "https://github.com/anncwb"
+    "name": "pengGgxp"
   },
   "type": "module",
   "scripts": {
@@ -47,6 +44,7 @@
     "dev:antd": "pnpm -F @vben/web-antd run dev",
     "workbench": "pnpm -F @kill-clip/desktop start",
     "package:win": "pnpm build:antd && pnpm -F @kill-clip/desktop exec node scripts/package-win.mjs",
+    "setup:flowblur": "node apps/desktop/scripts/setup-flowblur.mjs",
     "test:workbench": "pnpm exec vitest run apps/desktop/src",
     "dev:antdv-next": "pnpm -F @vben/web-antdv-next run dev",
     "dev:docs": "pnpm -F @vben/docs run dev",

@@ -1,5 +1,5 @@
 // Electron's sandboxed preload uses a restricted CommonJS loader.
-/* eslint-disable @typescript-eslint/no-require-imports, @typescript-eslint/no-var-requires */
+// oxlint-disable-next-line typescript/no-require-imports, typescript/no-var-requires
 const { contextBridge, ipcRenderer, webUtils } = require('electron');
 
 const prefix = 'workbench:';
@@ -13,6 +13,7 @@ contextBridge.exposeInMainWorld('clipWorkbench', {
   newProject: invoke('new'),
   openProject: invoke('open'),
   saveProject: invoke('save'),
+  retrySave: invoke('retry-save'),
   update: invoke('update'),
   importFiles: invoke('files'),
   importDirectory: invoke('scan'),
@@ -27,9 +28,20 @@ contextBridge.exposeInMainWorld('clipWorkbench', {
   cancelExport: invoke('cancel'),
   reveal: invoke('reveal'),
   recycle: invoke('cleanup'),
+  onSaveState(callback) {
+    const listener = (_event, state) => callback(state);
+    ipcRenderer.on(`${prefix}save-state`, listener);
+    return () => ipcRenderer.removeListener(`${prefix}save-state`, listener);
+  },
   onProgress(callback) {
     const listener = (_event, state) => callback(state);
     ipcRenderer.on(`${prefix}progress`, listener);
     return () => ipcRenderer.removeListener(`${prefix}progress`, listener);
+  },
+  onImportProgress(callback) {
+    const listener = (_event, state) => callback(state);
+    ipcRenderer.on(`${prefix}import-progress`, listener);
+    return () =>
+      ipcRenderer.removeListener(`${prefix}import-progress`, listener);
   },
 });

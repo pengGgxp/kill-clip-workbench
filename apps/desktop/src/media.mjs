@@ -246,6 +246,20 @@ export async function fileIdentity(file) {
   return [info.dev, info.ino, info.size, info.mtimeNs, info.ctimeNs].join(':');
 }
 
+export function sameFileIdentity(expected, actual) {
+  if (typeof expected !== 'string' || typeof actual !== 'string') return false;
+  const expectedFields = expected.split(':');
+  const actualFields = actual.split(':');
+  // Windows can change ctime without changing the media contents.
+  return (
+    expectedFields.length === 5 &&
+    actualFields.length === 5 &&
+    expectedFields
+      .slice(0, 4)
+      .every((field, index) => field === actualFields[index])
+  );
+}
+
 export async function probe(file, signal) {
   const identity = await fileIdentity(file);
   const data = JSON.parse(

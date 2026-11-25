@@ -26,6 +26,7 @@ import {
   readJson,
   renderVolume,
   resolutions,
+  sameFileIdentity,
   videoExtensions,
   writeJson,
 } from './media.mjs';
@@ -292,7 +293,12 @@ async function hydrate(data, file) {
       }
       if (!/^kills-\d+\.mp4$/.test(saved.name ?? '')) continue;
       const output = path.join(savedResult.folder, saved.name);
-      if ((await fileIdentity(output).catch(() => '')) !== saved.identity) {
+      if (
+        !sameFileIdentity(
+          saved.identity,
+          await fileIdentity(output).catch(() => ''),
+        )
+      ) {
         volumes.push({
           ...saved,
           status: 'failed',
@@ -440,7 +446,9 @@ async function exportProject() {
         for (const source of sources.filter(({ id }) =>
           volume.clips.some(({ videoId }) => id === videoId),
         )) {
-          if ((await fileIdentity(source.path)) !== source.identity)
+          if (
+            !sameFileIdentity(source.identity, await fileIdentity(source.path))
+          )
             throw new Error(`${source.name} 已改变，请重新导入`);
         }
         const output = await renderVolume(
@@ -510,14 +518,14 @@ async function recycleSources() {
   if (answer.response !== 1) return { project, recycled: [], errors: [] };
   await stat(selected.report);
   for (const output of selected.outputs) {
-    if ((await fileIdentity(output.path)) !== output.identity)
+    if (!sameFileIdentity(output.identity, await fileIdentity(output.path)))
       throw new Error('已验证的成片发生变化，清理已停止');
   }
   const recycled = [];
   const errors = [];
   for (const source of selected.sources) {
     try {
-      if ((await fileIdentity(source.path)) !== source.identity)
+      if (!sameFileIdentity(source.identity, await fileIdentity(source.path)))
         throw new Error('文件已改变');
       await shell.trashItem(source.path);
       recycled.push(source.path);

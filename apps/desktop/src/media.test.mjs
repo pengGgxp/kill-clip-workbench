@@ -14,7 +14,15 @@ import {
   probe,
   renderVolume,
   runFFmpeg,
+  sameFileIdentity,
 } from './media.mjs';
+
+it('ignores change-time differences but detects content identity differences', () => {
+  const original = '1:2:3:4:5';
+  assert.equal(sameFileIdentity(original, '1:2:3:4:6'), true);
+  assert.equal(sameFileIdentity(original, '1:2:3:7:5'), false);
+  assert.equal(sameFileIdentity(original, '1:2:3:4'), false);
+});
 
 it('uses the first source clip dimensions for each volume in source mode', () => {
   const volume = { clips: [{ videoId: 'second' }] };

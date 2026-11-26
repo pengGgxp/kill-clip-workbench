@@ -4,7 +4,7 @@ Windows 本地桌面应用。界面使用 Vben Admin v5 和 Ant Design Vue，桌
 
 ## 安装与启动
 
-双击 `Kill-Clip-Workbench-Setup-1.2.1-x64.exe` 安装 Windows x64 版，再从开始菜单打开 **Kill Clip Workbench**。安装包内置 Electron、FFmpeg、FFprobe 和运动模糊运行环境，无需另装 Node.js 或 Python。当前安装包未签名，Windows 可能提示发布者未知。
+双击 `Kill-Clip-Workbench-Setup-1.2.2-x64.exe` 安装 Windows x64 版，再从开始菜单打开 **Kill Clip Workbench**。安装包内置 Electron、FFmpeg、FFprobe 和运动模糊运行环境，无需另装 Node.js 或 Python。当前安装包未签名，Windows 可能提示发布者未知。
 
 ## 从源码启动
 

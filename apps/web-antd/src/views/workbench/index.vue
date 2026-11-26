@@ -1175,7 +1175,10 @@ function recycle() {
                 v-for="slot in [0, 1]"
                 :key="slot"
                 :ref="outputPlayerRefs[slot]"
-                :class="{ 'output-player-active': outputSlot === slot }"
+                :class="{
+                  'output-player-active': outputSlot === slot,
+                  'output-player-standby': outputSlot !== slot,
+                }"
                 :src="outputSlots[slot]?.url"
                 preload="auto"
                 playsinline
@@ -1973,7 +1976,7 @@ h2 {
   object-fit: contain;
 }
 
-.video-stage > video:not(.output-player-active) {
+.video-stage > video.output-player-standby {
   position: absolute;
   inset: 0;
   width: 100%;

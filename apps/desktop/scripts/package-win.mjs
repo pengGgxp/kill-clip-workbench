@@ -43,7 +43,13 @@ try {
   const licenses = path.join(stage, 'licenses');
   await Promise.all([mkdir(source), mkdir(licenses)]);
   await Promise.all([
-    ...['clip-plan.mjs', 'main.mjs', 'media.mjs', 'preload.cjs'].map((name) =>
+    ...[
+      'cleanup.mjs',
+      'clip-plan.mjs',
+      'main.mjs',
+      'media.mjs',
+      'preload.cjs',
+    ].map((name) =>
       copyFile(
         new URL(`../src/${name}`, import.meta.url),
         path.join(source, name),

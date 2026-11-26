@@ -14,6 +14,12 @@ import process from 'node:process';
 import { pipeline } from 'node:stream/promises';
 import { fileURLToPath } from 'node:url';
 
+import {
+  clipFrameCount,
+  outputFps as fps,
+  outputDuration,
+} from './clip-plan.mjs';
+
 const bundledTools =
   process.platform === 'win32' && process.resourcesPath && !process.defaultApp
     ? path.join(process.resourcesPath, 'media')
@@ -46,11 +52,19 @@ export const videoExtensions = new Set([
   '.webm',
   '.wmv',
 ]);
+export const audioTypes = {
+  '.aac': 'audio/aac',
+  '.flac': 'audio/flac',
+  '.m4a': 'audio/mp4',
+  '.mp3': 'audio/mpeg',
+  '.ogg': 'audio/ogg',
+  '.opus': 'audio/ogg',
+  '.wav': 'audio/wav',
+};
 export const resolutions = {
   '1080p': [1920, 1080],
   '720p': [1280, 720],
 };
-const fps = 30;
 const ffmpegOptions = [
   '-hide_banner',
   '-nostdin',
@@ -146,6 +160,70 @@ function run(executable, args, options) {
 
 export function runFFmpeg(args, options) {
   return run(ffmpeg, [...ffmpegOptions, ...args], options);
+}
+
+export async function audioPeaks(file, duration, signal) {
+  const sampleRate = 8000;
+  const peakCount = 4096;
+  const samplesPerPeak = Math.max(
+    1,
+    Math.ceil((duration * sampleRate) / peakCount),
+  );
+  const peaks = Array.from(
+    {
+      length: Math.min(
+        peakCount,
+        Math.ceil((duration * sampleRate) / samplesPerPeak),
+      ),
+    },
+    () => 0,
+  );
+  const { child, done } = startProcess(
+    ffmpeg,
+    [
+      ...ffmpegOptions,
+      '-protocol_whitelist',
+      'file',
+      '-i',
+      file,
+      '-map',
+      '0:a:0',
+      '-af',
+      `aresample=${sampleRate}:async=1:first_pts=0`,
+      '-ac',
+      '1',
+      '-t',
+      String(duration),
+      '-f',
+      's16le',
+      'pipe:1',
+    ],
+    { signal, pipeOutput: true },
+  );
+  let sample = 0;
+  let lowByte;
+  await Promise.all([
+    done,
+    (async () => {
+      for await (const chunk of child.stdout) {
+        for (const byte of chunk) {
+          if (lowByte === undefined) {
+            lowByte = byte;
+            continue;
+          }
+          const amplitude = Math.abs(((lowByte | (byte << 8)) << 16) >> 16);
+          lowByte = undefined;
+          const index = Math.floor(sample++ / samplesPerPeak);
+          if (index < peaks.length && amplitude > peaks[index])
+            peaks[index] = amplitude;
+        }
+      }
+    })(),
+  ]);
+  return {
+    peaks: peaks.map((peak) => peak / 32_768),
+    secondsPerPeak: samplesPerPeak / sampleRate,
+  };
 }
 
 async function renderFlowBlur({
@@ -260,9 +338,33 @@ export function sameFileIdentity(expected, actual) {
   );
 }
 
-export async function probe(file, signal) {
-  const identity = await fileIdentity(file);
-  const data = JSON.parse(
+export function reusableProbeMetadata(cached, identity) {
+  if (
+    !sameFileIdentity(cached?.identity, identity) ||
+    !Number.isFinite(cached.duration) ||
+    cached.duration <= 0 ||
+    !Number.isSafeInteger(cached.width) ||
+    cached.width <= 0 ||
+    !Number.isSafeInteger(cached.height) ||
+    cached.height <= 0 ||
+    !Number.isFinite(cached.fps) ||
+    cached.fps < 0 ||
+    typeof cached.hasAudio !== 'boolean'
+  ) {
+    return null;
+  }
+  return {
+    duration: cached.duration,
+    identity,
+    width: cached.width,
+    height: cached.height,
+    fps: cached.fps,
+    hasAudio: cached.hasAudio,
+  };
+}
+
+async function inspectMedia(file, signal) {
+  return JSON.parse(
     await run(
       ffprobe,
       [
@@ -279,6 +381,21 @@ export async function probe(file, signal) {
       { signal },
     ),
   );
+}
+
+export async function probeAudio(file, signal) {
+  const identity = await fileIdentity(file);
+  const data = await inspectMedia(file, signal);
+  const audio = data.streams?.find(({ codec_type }) => codec_type === 'audio');
+  const duration = Number(audio?.duration) || Number(data.format?.duration);
+  if (!audio || !Number.isFinite(duration) || duration <= 0)
+    throw new Error('未找到有效的音轨或时长');
+  return { duration, identity };
+}
+
+export async function probe(file, signal) {
+  const identity = await fileIdentity(file);
+  const data = await inspectMedia(file, signal);
   const video = data.streams?.find(
     (stream) =>
       stream.codec_type === 'video' && !stream.disposition?.attached_pic,
@@ -342,7 +459,13 @@ export async function renderVolume(
   limit,
   signal,
   progress,
-  { motionBlur = false } = {},
+  {
+    motionBlur = false,
+    music,
+    musicVolume = 0.25,
+    sourceVolume = 1,
+    volumeStart = 0,
+  } = {},
 ) {
   const working = await mkdtemp(path.join(folder, '.render-'));
   const name = `kills-${String(volume.number).padStart(3, '0')}.mp4`;
@@ -352,13 +475,9 @@ export async function renderVolume(
     const concat = ['ffconcat version 1.0'];
     let completed = 0;
     let framesDone = 0;
-    const totalFrames = Math.floor(limit * fps + 1e-7);
     for (const [index, clip] of volume.clips.entries()) {
       const segment = `part-${index}.mp4`;
-      const frameCount = Math.min(
-        totalFrames - framesDone,
-        Math.max(1, Math.floor(clip.duration * fps + 1e-7)),
-      );
+      const frameCount = clipFrameCount(clip, framesDone, limit);
       if (frameCount < 1) throw new Error('分卷内的短片段超过帧数上限');
       framesDone += frameCount;
       const duration = (frameCount / fps).toFixed(6);
@@ -451,10 +570,34 @@ export async function renderVolume(
     const temporary = path.join(working, 'result.mp4');
     await writeFile(list, `${concat.join('\n')}\n`, 'utf8');
     const planned = framesDone / fps;
-    // Keep a frame of headroom for AAC packet padding and MP4 timestamp rounding.
-    const ceiling =
-      Math.floor(Math.min(planned, limit - 1 / fps) * 1000) / 1000;
-    progress(88, '正在拼接');
+    const ceiling = outputDuration(framesDone, limit);
+    const musicOffset = music ? volumeStart - music.start : 0;
+    const hasMusic =
+      music &&
+      musicVolume > 0 &&
+      musicOffset < music.duration &&
+      musicOffset + ceiling > 0;
+    const delay = Math.round(Math.max(0, -musicOffset) * 48_000);
+    const sourceFilter = `volume=${sourceVolume}`;
+    const musicInput = hasMusic
+      ? [
+          '-ss',
+          String(Math.max(0, musicOffset)),
+          '-protocol_whitelist',
+          'file',
+          '-i',
+          music.path,
+        ]
+      : [];
+    const audio = hasMusic
+      ? [
+          '-filter_complex',
+          `[0:a:0]${sourceFilter}[source];[1:a:0]aresample=48000:async=1:first_pts=0,volume=${musicVolume},adelay=${delay}S:all=1[music];[source][music]amix=inputs=2:duration=first:normalize=0[mix]`,
+          '-map',
+          '[mix]',
+        ]
+      : ['-map', '0:a:0', '-af', sourceFilter];
+    progress(88, hasMusic ? '正在拼接与混音' : '正在拼接');
     await runFFmpeg(
       [
         '-n',
@@ -466,12 +609,12 @@ export async function renderVolume(
         'file',
         '-i',
         list,
+        ...musicInput,
         '-t',
         String(ceiling),
         '-map',
         '0:v:0',
-        '-map',
-        '0:a:0',
+        ...audio,
         '-c:v',
         'copy',
         '-c:a',

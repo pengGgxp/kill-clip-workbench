@@ -50,7 +50,7 @@ export interface ClipPlan {
 
 export function parseTimeToken(
   token: string,
-): { seconds: number; value: string } | { error: string; value: string };
+): { error: string; value: string } | { seconds: number; value: string };
 
 export function parseTimestampList(input: string): {
   values: number[];
@@ -64,3 +64,13 @@ export function buildClipPlan(
 ): ClipPlan;
 
 export function formatTimestamp(seconds: number): string;
+
+export interface OutputClip extends PlannedClip {
+  outputStart: number;
+  outputEnd: number;
+}
+
+export function buildOutputTimeline(
+  volumes: PlannedVolume[],
+  limit: number,
+): { clips: OutputClip[]; duration: number; volumeStarts: number[] };

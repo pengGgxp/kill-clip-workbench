@@ -237,6 +237,52 @@ export function buildClipPlan(videos, settings) {
   };
 }
 
+export const outputFps = 30;
+
+export function clipFrameCount(clip, framesDone, limit) {
+  return Math.min(
+    Math.floor(limit * outputFps + 1e-7) - framesDone,
+    Math.max(1, Math.floor(clip.duration * outputFps + 1e-7)),
+  );
+}
+
+export function outputDuration(frames, limit) {
+  // Leave room for AAC padding and MP4 timestamp rounding.
+  return (
+    Math.floor(Math.min(frames / outputFps, limit - 1 / outputFps) * 1000) /
+    1000
+  );
+}
+
+export function buildOutputTimeline(volumes, limit) {
+  let duration = 0;
+  const clips = [];
+  const volumeStarts = [];
+  for (const volume of volumes) {
+    volumeStarts.push(duration);
+    let frames = 0;
+    const first = clips.length;
+    for (const clip of volume.clips) {
+      const count = clipFrameCount(clip, frames, limit);
+      if (count < 1) break;
+      const outputStart = duration + frames / outputFps;
+      frames += count;
+      clips.push({
+        ...clip,
+        outputStart,
+        outputEnd: duration + frames / outputFps,
+      });
+    }
+    duration += outputDuration(frames, limit);
+    if (clips.length > first) {
+      while (clips.length > first && clips.at(-1).outputStart >= duration)
+        clips.pop();
+      if (clips.length > first) clips.at(-1).outputEnd = duration;
+    }
+  }
+  return { clips, duration, volumeStarts };
+}
+
 export function formatTimestamp(seconds) {
   if (!Number.isFinite(seconds) || seconds < 0) {
     return '—';

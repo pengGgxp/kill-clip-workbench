@@ -91,11 +91,47 @@ if (!(Test-WorkbenchUrl)) {
 }
 
 $env:KILL_CLIP_DEV_URL = $viteUrl
+$logId = [guid]::NewGuid().ToString('N')
+$stdoutLog = Join-Path $env:TEMP "kill-clip-workbench-$logId.stdout.log"
+$stderrLog = Join-Path $env:TEMP "kill-clip-workbench-$logId.stderr.log"
 $electronProcess = Start-Process `
   -FilePath $electron `
-  -ArgumentList @('.') `
+  -ArgumentList @('.', '--enable-logging') `
   -WorkingDirectory $desktopRoot `
+  -RedirectStandardOutput $stdoutLog `
+  -RedirectStandardError $stderrLog `
   -PassThru
 
-Write-Host "Development workbench started (PID $($electronProcess.Id))."
-Write-Host "Workbench URL: ${viteUrl}workbench"
+$windowProcess = $null
+$deadline = [DateTime]::UtcNow.AddSeconds(60)
+while ([DateTime]::UtcNow -lt $deadline) {
+  $windowProcess = Get-Process -Name electron -ErrorAction SilentlyContinue |
+    Where-Object {
+      $_.Path -eq $electron -and $_.MainWindowTitle -eq '击杀点剪辑工作台'
+    } |
+    Select-Object -First 1
+  if ($windowProcess) {
+    break
+  }
+
+  $electronProcess.Refresh()
+  if ($electronProcess.HasExited) {
+    break
+  }
+  Start-Sleep -Milliseconds 250
+}
+
+if (!$windowProcess) {
+  $diagnostics = @()
+  foreach ($log in @($stdoutLog, $stderrLog)) {
+    if (Test-Path -LiteralPath $log) {
+      $diagnostics += Get-Content -Tail 40 -LiteralPath $log
+    }
+  }
+  if ($diagnostics.Count -gt 0) {
+    Write-Host ($diagnostics -join [Environment]::NewLine)
+  }
+  throw "The desktop workbench window did not open within 60 seconds. Electron logs: $stdoutLog and $stderrLog"
+}
+
+Write-Host "Development desktop workbench opened (PID $($windowProcess.Id))."

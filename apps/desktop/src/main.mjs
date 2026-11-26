@@ -16,16 +16,21 @@ import {
   shell,
 } from 'electron';
 
-import { buildClipPlan } from './clip-plan.mjs';
+import { restoreCleanupSources } from './cleanup.mjs';
+import { buildClipPlan, buildOutputTimeline } from './clip-plan.mjs';
 import {
+  audioPeaks,
+  audioTypes,
   checkFlowBlur,
   ensureSpace,
   fileIdentity,
   outputSize,
   probe,
+  probeAudio,
   readJson,
   renderVolume,
   resolutions,
+  reusableProbeMetadata,
   sameFileIdentity,
   videoExtensions,
   writeJson,
@@ -52,6 +57,7 @@ const defaults = {
   resolution: 'source',
 };
 const channels = 'workbench:';
+const defaultMix = { sourceVolume: 1, musicVolume: 0.25, musicStart: 0 };
 let window;
 let project;
 let projectFile;
@@ -61,6 +67,7 @@ let lastExport;
 let receipt;
 let tail = Promise.resolve();
 let quitting = false;
+const waveformJobs = new Map();
 const media = new Map();
 
 protocol.registerSchemesAsPrivileged([
@@ -83,6 +90,8 @@ function newProject(name = '未命名项目') {
     updatedAt: date,
     videos: [],
     settings: { ...defaults },
+    mix: { ...defaultMix },
+    music: null,
     outputDirectory: '',
     result: null,
   };
@@ -94,16 +103,63 @@ function registerMedia(file) {
   return `clip-media://local/${id}`;
 }
 
-function localVideo(file) {
+function localPath(file) {
   return (
     typeof file === 'string' &&
     path.isAbsolute(file) &&
-    (process.platform !== 'win32' || /^[a-z]:[\\/]/i.test(file)) &&
-    videoExtensions.has(path.extname(file).toLowerCase())
+    (process.platform !== 'win32' || /^[a-z]:[\\/]/i.test(file))
   );
 }
 
-async function describeVideo(file, marks = [], id = randomUUID()) {
+function localVideo(file) {
+  return (
+    localPath(file) && videoExtensions.has(path.extname(file).toLowerCase())
+  );
+}
+
+function localAudio(file) {
+  return (
+    localPath(file) &&
+    Object.hasOwn(audioTypes, path.extname(file).toLowerCase())
+  );
+}
+
+async function describeMusic(file) {
+  if (!localAudio(file)) throw new Error('请选择本机支持的音频文件');
+  const resolved = await realpath(file);
+  if (!localAudio(resolved)) throw new Error('音频指向不受支持的位置');
+  const metadata = await probeAudio(resolved);
+  return {
+    ...metadata,
+    id: randomUUID(),
+    name: path.basename(resolved),
+    path: resolved,
+    url: registerMedia(resolved),
+    error: '',
+  };
+}
+
+function validatedMix(raw) {
+  const mix = {};
+  for (const [key, fallback] of Object.entries(defaultMix)) {
+    const value = raw?.[key] ?? fallback;
+    if (
+      !Number.isFinite(value) ||
+      value < 0 ||
+      value > (key === 'musicStart' ? Number.MAX_SAFE_INTEGER / 1000 : 1)
+    )
+      throw new Error('音轨设置超出有效范围');
+    mix[key] = value;
+  }
+  return mix;
+}
+
+async function describeVideo(
+  file,
+  marks = [],
+  id = randomUUID(),
+  cachedMetadata,
+) {
   if (!localVideo(file)) throw new Error('请选择本机支持的视频文件');
   const entry = {
     id,
@@ -121,9 +177,13 @@ async function describeVideo(file, marks = [], id = randomUUID()) {
   try {
     const resolved = await realpath(file);
     if (!localVideo(resolved)) throw new Error('视频指向不受支持的位置');
+    const identity = await fileIdentity(resolved);
+    const metadata =
+      reusableProbeMetadata(cachedMetadata, identity) ??
+      (await probe(resolved));
     return {
       ...entry,
-      ...(await probe(resolved)),
+      ...metadata,
       path: resolved,
       url: registerMedia(resolved),
     };
@@ -181,10 +241,18 @@ function validatedMarks(raw) {
 
 function projectData() {
   const plan = buildClipPlan(project.videos, project.settings);
+  const { url: _url, ...music } = project.music ?? {};
   return {
     ...project,
     plan,
     videos: project.videos.map(({ url: _url, ...video }) => video),
+    music: project.music ? music : null,
+    cleanupSources:
+      receipt?.sources.map(({ id, path, identity }) => ({
+        id,
+        path,
+        identity,
+      })) ?? null,
   };
 }
 
@@ -259,19 +327,47 @@ async function hydrate(data, file) {
     throw new Error('无法打开此工作台项目');
   }
   const settings = validatedSettings(data.settings);
+  const mix = validatedMix(data.mix);
   const videos = [];
   for (const video of data.videos) {
-    videos.push(await describeVideo(video.path, validatedMarks(video.marks)));
+    if (video.error === '已移入回收站') continue;
+    videos.push(
+      await describeVideo(
+        video.path,
+        validatedMarks(video.marks),
+        typeof video.id === 'string' ? video.id : randomUUID(),
+        video,
+      ),
+    );
   }
   const restored = {
     ...newProject(data.name),
     settings,
+    mix,
     videos,
     createdAt: data.createdAt ?? new Date().toISOString(),
     outputDirectory:
       typeof data.outputDirectory === 'string' ? data.outputDirectory : '',
     result: null,
   };
+  if (data.music && localAudio(data.music.path)) {
+    const file = data.music.path;
+    try {
+      restored.music = await describeMusic(file);
+    } catch (error) {
+      restored.music = {
+        id: randomUUID(),
+        path: file,
+        name: path.basename(file),
+        duration: 0,
+        url: '',
+        error:
+          error.code === 'ENOENT'
+            ? '配乐文件不存在，请重新选择'
+            : error.message,
+      };
+    }
+  }
   const savedResult = data.result;
   if (
     savedResult &&
@@ -291,7 +387,15 @@ async function hydrate(data, file) {
         );
         continue;
       }
-      if (!/^kills-\d+\.mp4$/.test(saved.name ?? '')) continue;
+      if (!/^kills-\d+\.mp4$/.test(saved.name ?? '')) {
+        volumes.push({
+          ...saved,
+          status: 'failed',
+          detail: '成片名称无效',
+          url: '',
+        });
+        continue;
+      }
       const output = path.join(savedResult.folder, saved.name);
       if (
         !sameFileIdentity(
@@ -309,11 +413,29 @@ async function hydrate(data, file) {
       }
       volumes.push({ ...saved, path: output, url: registerMedia(output) });
     }
-    restored.result = { ...savedResult, volumes };
+    restored.result = {
+      ...savedResult,
+      report: path.join(savedResult.folder, 'export-report.json'),
+      volumes,
+    };
   }
+  const sources = await restoreCleanupSources(
+    restored.result,
+    data.cleanupSources,
+    data.videos,
+    videos,
+    settings,
+  );
   project = restored;
   projectFile = file;
-  receipt = undefined;
+  receipt =
+    sources.length > 0
+      ? {
+          sources,
+          outputs: restored.result.volumes,
+          report: restored.result.report,
+        }
+      : undefined;
 }
 
 function samePath(a, b) {
@@ -365,6 +487,12 @@ const videoFilters = [
     extensions: [...videoExtensions].map((extension) => extension.slice(1)),
   },
 ];
+const audioFilters = [
+  {
+    name: '背景音乐',
+    extensions: Object.keys(audioTypes).map((extension) => extension.slice(1)),
+  },
+];
 
 async function chooseFolder() {
   const answer = await dialog.showOpenDialog(window, {
@@ -392,8 +520,19 @@ async function exportProject() {
   )
     throw new Error('请先修正剪辑计划');
   if (!project.outputDirectory) throw new Error('请先选择输出目录');
+  if (snapshot.music && snapshot.mix.musicVolume > 0) {
+    if (snapshot.music.error) throw new Error(snapshot.music.error);
+    if (
+      !sameFileIdentity(
+        snapshot.music.identity,
+        await fileIdentity(snapshot.music.path).catch(() => null),
+      )
+    )
+      throw new Error('配乐已移动或发生变化，请重新选择');
+  }
   if (snapshot.settings.motionBlur) await checkFlowBlur();
   const limit = snapshot.settings.maxVolumeHours * 3600;
+  const { volumeStarts } = buildOutputTimeline(plan.volumes, limit);
   const folderRoot = await realpath(snapshot.outputDirectory);
   const outputSizes = plan.volumes.map((volume) =>
     outputSize(snapshot.settings.resolution, volume, snapshot.videos),
@@ -461,7 +600,16 @@ async function exportProject() {
             Object.assign(state, { percent, detail });
             sendJob(result);
           },
-          { motionBlur: snapshot.settings.motionBlur },
+          {
+            motionBlur: snapshot.settings.motionBlur,
+            sourceVolume: snapshot.mix.sourceVolume,
+            musicVolume: snapshot.mix.musicVolume,
+            music: snapshot.music && {
+              ...snapshot.music,
+              start: snapshot.mix.musicStart,
+            },
+            volumeStart: volumeStarts[index],
+          },
         );
         Object.assign(state, output, {
           status: 'success',
@@ -481,8 +629,12 @@ async function exportProject() {
       ...result,
       plan,
       settings: snapshot.settings,
+      mix: snapshot.mix,
+      music: snapshot.music && {
+        path: snapshot.music.path,
+        name: snapshot.music.name,
+      },
     });
-    await persist();
     if (
       !controller.signal.aborted &&
       result.volumes.every(({ status }) => status === 'success')
@@ -493,6 +645,7 @@ async function exportProject() {
         report: result.report,
       };
     }
+    await persist();
     return result;
   })().finally(() => {
     job = undefined;
@@ -518,10 +671,16 @@ async function recycleSources() {
   if (answer.response !== 1) return { project, recycled: [], errors: [] };
   await stat(selected.report);
   for (const output of selected.outputs) {
-    if (!sameFileIdentity(output.identity, await fileIdentity(output.path)))
+    if (
+      !sameFileIdentity(
+        output.identity,
+        await fileIdentity(output.path).catch(() => null),
+      )
+    )
       throw new Error('已验证的成片发生变化，清理已停止');
   }
   const recycled = [];
+  const recycledIds = new Set();
   const errors = [];
   for (const source of selected.sources) {
     try {
@@ -529,23 +688,28 @@ async function recycleSources() {
         throw new Error('文件已改变');
       await shell.trashItem(source.path);
       recycled.push(source.path);
-      const entry = project.videos.find(({ id }) => id === source.id);
-      if (entry)
-        Object.assign(entry, { error: '已移入回收站', duration: 0, url: '' });
+      recycledIds.add(source.id);
     } catch (error) {
       errors.push(`${source.name}：${error.message}`);
     }
   }
+  project.videos = project.videos.filter(({ id, url }) => {
+    if (!recycledIds.has(id)) return true;
+    if (url) media.delete(new URL(url).pathname.slice(1));
+    return false;
+  });
   receipt =
     errors.length > 0
       ? {
           ...selected,
-          sources: selected.sources.filter(
-            ({ path: file }) => !recycled.includes(file),
-          ),
+          sources: selected.sources.filter(({ id }) => !recycledIds.has(id)),
         }
       : undefined;
-  await persist();
+  try {
+    await persist();
+  } catch (error) {
+    errors.push(`清理结果保存失败：${error.message}`);
+  }
   return { project, recycled, errors };
 }
 
@@ -573,13 +737,16 @@ async function serveMedia(request) {
   const info = await stat(file).catch(() => null);
   if (!info?.isFile() || info.size === 0)
     return new Response(null, { status: 404 });
+  const extension = path.extname(file).toLowerCase();
   const contentType =
+    audioTypes[extension] ??
     {
       '.mp4': 'video/mp4',
       '.mov': 'video/quicktime',
       '.webm': 'video/webm',
       '.mkv': 'video/x-matroska',
-    }[path.extname(file).toLowerCase()] ?? 'application/octet-stream';
+    }[extension] ??
+    'application/octet-stream';
   const headers = { 'Accept-Ranges': 'bytes', 'Content-Type': contentType };
   const range = request.headers.get('range');
   const match = range && /^bytes=(\d+)-(\d*)$/.exec(range);
@@ -664,12 +831,50 @@ async function start() {
     );
     return new Response(response.body, { status: response.status, headers });
   });
-  handle('project', () => ({
+  const projectState = () => ({
     project,
     projectFile,
     saveState,
     cleanup: receipt?.sources ?? [],
-  }));
+  });
+  handle('project', projectState);
+  handle(
+    'waveform',
+    async (id, url) => {
+      const kind =
+        project.music?.id === id && project.music.url === url
+          ? 'music'
+          : 'source';
+      const entry =
+        kind === 'music'
+          ? project.music
+          : project.videos.find(
+              (video) => video.id === id && video.url === url && video.hasAudio,
+            );
+      if (!entry?.url || entry.error) return null;
+      waveformJobs.get(kind)?.controller.abort();
+      const controller = new AbortController();
+      const current = { url, controller };
+      waveformJobs.set(kind, current);
+      try {
+        return await audioPeaks(entry.path, entry.duration, controller.signal);
+      } catch (error) {
+        if (controller.signal.aborted) return null;
+        throw error;
+      } finally {
+        if (waveformJobs.get(kind) === current) waveformJobs.delete(kind);
+      }
+    },
+    { direct: true },
+  );
+  handle(
+    'cancel-waveform',
+    (url) => {
+      for (const pending of waveformJobs.values())
+        if (pending.url === url) pending.controller.abort();
+    },
+    { direct: true },
+  );
   handle(
     'new',
     async (name) => {
@@ -698,7 +903,7 @@ async function start() {
       const data = await readJson(file);
       await hydrate(data, file);
       await persist();
-      return { project, projectFile };
+      return projectState();
     },
     { mutable: true },
   );
@@ -722,8 +927,9 @@ async function start() {
   handle('retry-save', persist, { mutable: true });
   handle(
     'update',
-    async ({ settings, marks, remove }) => {
+    async ({ settings, marks, remove, mix }) => {
       if (settings) project.settings = validatedSettings(settings);
+      if (mix) project.mix = validatedMix(mix);
       if (marks) {
         const entry = project.videos.find(({ id }) => id === marks.id);
         if (!entry) throw new Error('视频已移除');
@@ -733,6 +939,28 @@ async function start() {
         project.videos = project.videos.filter(({ id }) => id !== remove);
       receipt = undefined;
       await persist();
+    },
+    { mutable: true },
+  );
+  handle(
+    'music',
+    async (remove) => {
+      let music = null;
+      if (remove !== true) {
+        const answer = await dialog.showOpenDialog(window, {
+          properties: ['openFile'],
+          filters: audioFilters,
+        });
+        if (!answer.filePaths[0]) return null;
+        music = await describeMusic(answer.filePaths[0]);
+      }
+      if (project.music?.url)
+        media.delete(new URL(project.music.url).pathname.slice(1));
+      project.music = music;
+      if (remove === true) project.mix.musicStart = 0;
+      receipt = undefined;
+      await persist();
+      return projectState();
     },
     { mutable: true },
   );
@@ -819,6 +1047,7 @@ async function start() {
     if (quitting) return;
     event.preventDefault();
     job?.controller.abort();
+    for (const pending of waveformJobs.values()) pending.controller.abort();
     void tail.then(async () => {
       const active = job;
       active?.controller.abort();

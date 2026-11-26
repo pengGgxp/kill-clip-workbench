@@ -1,6 +1,7 @@
 <script lang="ts" setup>
 import type {
   ImportProgress,
+  Mix,
   Project,
   RenderResult,
   SaveState,
@@ -8,18 +9,20 @@ import type {
   Video,
 } from './desktop';
 
-import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue';
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue';
 
 import {
   Clapperboard,
-  Crosshair,
   Download,
   FilePlus2,
   Film,
   FolderOpen,
   FolderSearch,
+  Fullscreen,
   MinusCircle,
+  Pause,
   Pencil,
+  Play,
   Plus,
   Save,
   Trash2,
@@ -39,6 +42,7 @@ import {
   InputNumber,
   Modal,
   Progress,
+  Segmented,
   Select,
   Space,
   Spin,
@@ -51,16 +55,21 @@ import {
 
 import {
   buildClipPlan,
+  buildOutputTimeline,
   formatTimestamp,
   parseTimestampList,
 } from '../../../../desktop/src/clip-plan.mjs';
-import { desktop, initialSettings } from './desktop';
+import { desktop, initialMix, initialSettings } from './desktop';
+import MusicTimeline from './music-timeline.vue';
+import Timeline from './timeline.vue';
 
 const { message } = App.useApp();
 const project = ref<Project>({
   name: '未命名项目',
   videos: [],
   settings: { ...initialSettings },
+  mix: { ...initialMix },
+  music: null,
   outputDirectory: '',
   result: null,
 });
@@ -68,8 +77,22 @@ const projectFile = ref<string>();
 const cleanup = ref<Video[]>([]);
 const selected = ref('');
 const player = ref<HTMLVideoElement>();
+const stage = ref<HTMLElement>();
+const musicPlayer = ref<HTMLAudioElement>();
+const musicPlaybackError = ref(false);
 const position = ref(0);
+const playing = ref(false);
+const playerReady = ref(false);
+const previousLevels = {
+  sourceVolume: initialMix.sourceVolume,
+  musicVolume: initialMix.musicVolume,
+};
+let videoAdvancing = false;
+let musicFrame = 0;
 const playbackError = ref(false);
+const previewMode = ref<'output' | 'source'>('source');
+const outputPreviewPosition = ref(0);
+const outputPlayRequested = ref(false);
 const draft = ref('');
 const inputError = ref('');
 const edit = ref<number>();
@@ -86,12 +109,14 @@ const newName = ref('');
 const exportOpen = ref(false);
 const cleanupOpen = ref(false);
 const preview = ref<RenderResult['volumes'][number]>();
+const resultPlaybackError = ref(false);
 const panel = ref('plan');
 const exportStarted = ref(false);
 
 const active = computed(() =>
   project.value.videos.find(({ id }) => id === selected.value),
 );
+const canPlay = computed(() => playerReady.value && !playbackError.value);
 const exportProgressPercent = computed(() => {
   const volumes = project.value.result?.volumes ?? [];
   const totalDuration = volumes.reduce(
@@ -115,11 +140,17 @@ const exportProgressDescription = computed(() => {
     return `${volume.name || `第 ${volume.number} 卷`} · ${volume.detail || '正在处理'}`;
   return '正在准备下一卷';
 });
-const videoAspectRatio = computed(() =>
-  active.value?.width && active.value?.height
-    ? `${active.value.width} / ${active.value.height}`
-    : '16 / 9',
-);
+const videoAspectRatio = computed(() => {
+  if (
+    previewMode.value === 'output' &&
+    project.value.settings.resolution !== 'source'
+  )
+    return '16 / 9';
+  const dimensions = stageDimensions.value;
+  return dimensions?.width && dimensions.height
+    ? `${dimensions.width} / ${dimensions.height}`
+    : '16 / 9';
+});
 const resolutionHint = computed(() => {
   const dimensions = new Set(
     project.value.videos
@@ -134,6 +165,62 @@ const resolutionHint = computed(() => {
 const plan = computed(() =>
   buildClipPlan(project.value.videos, project.value.settings),
 );
+const activeRanges = computed(() =>
+  plan.value.clips.filter(({ videoId }) => videoId === active.value?.id),
+);
+const outputTimeline = computed(() =>
+  buildOutputTimeline(
+    plan.value.volumes,
+    project.value.settings.maxVolumeHours * 3600,
+  ),
+);
+function outputClipAt(time: number) {
+  const clips = outputTimeline.value.clips;
+  let left = 0;
+  let right = clips.length;
+  while (left < right) {
+    const middle = Math.floor((left + right) / 2);
+    const clip = clips[middle];
+    if (clip && time < clip.outputEnd) right = middle;
+    else left = middle + 1;
+  }
+  return clips[Math.min(left, clips.length - 1)];
+}
+const outputPreviewClip = computed(() =>
+  outputClipAt(outputPreviewPosition.value),
+);
+const stageVideo = computed(() =>
+  previewMode.value === 'output'
+    ? project.value.videos.find(
+        ({ id }) => id === outputPreviewClip.value?.videoId,
+      )
+    : active.value,
+);
+const stageDimensions = computed(() => {
+  if (previewMode.value === 'source') return active.value;
+  const volumeStart = outputTimeline.value.volumeStarts.findLast(
+    (start) => start <= outputPreviewPosition.value,
+  );
+  const firstClip =
+    volumeStart === undefined ? undefined : outputClipAt(volumeStart);
+  return project.value.videos.find(({ id }) => id === firstClip?.videoId);
+});
+const stageKey = computed(
+  () => `${previewMode.value}:${stageVideo.value?.url ?? ''}`,
+);
+const outputPlanKey = computed(() =>
+  JSON.stringify(
+    outputTimeline.value.clips.map(({ videoId, start, outputEnd }) => [
+      videoId,
+      start,
+      outputEnd,
+    ]),
+  ),
+);
+const previewModes = [
+  { label: '素材预览', value: 'source' },
+  { label: '成片预览', value: 'output' },
+];
 const canExport = computed(
   () =>
     plan.value.volumes.length > 0 &&
@@ -203,9 +290,14 @@ function errorText(error: unknown) {
 }
 
 function selectVideo(id: string) {
+  setPreviewMode('source');
   if (selected.value === id) return;
+  player.value?.pause();
+  stopMusicPreview();
   selected.value = id;
   position.value = 0;
+  playing.value = false;
+  playerReady.value = false;
   playbackError.value = false;
   draft.value = '';
   inputError.value = '';
@@ -213,6 +305,10 @@ function selectVideo(id: string) {
 }
 
 function applyProject(value: Project) {
+  if (value.createdAt !== project.value.createdAt) {
+    previousLevels.sourceVolume = initialMix.sourceVolume;
+    previousLevels.musicVolume = initialMix.musicVolume;
+  }
   project.value = value;
   if (!value.videos.some(({ id }) => id === selected.value))
     selectVideo(value.videos[0]?.id ?? '');
@@ -266,7 +362,10 @@ onMounted(() => {
     }
   });
 });
-onUnmounted(() => unsubscribe?.());
+onUnmounted(() => {
+  unsubscribe?.();
+  stopMusicPreview();
+});
 
 function importMedia(kind: 'directory' | 'drop' | 'files', files: File[] = []) {
   if (!desktop || locked.value) return;
@@ -308,15 +407,13 @@ function useProject(mode: 'new' | 'open' | 'save') {
       }
       return;
     }
-    const state =
-      mode === 'new'
-        ? await api.newProject(newName.value)
-        : await api.openProject();
+    const opened = mode === 'open' ? await api.openProject() : undefined;
+    const state = mode === 'new' ? await api.newProject(newName.value) : opened;
     if (!state) return;
     selectVideo('');
     applyProject(state.project);
     projectFile.value = state.projectFile;
-    cleanup.value = [];
+    cleanup.value = opened?.cleanup ?? [];
     newOpen.value = false;
     panel.value = 'plan';
   });
@@ -375,16 +472,319 @@ async function jump(id: string, time: number) {
   await nextTick();
   const element = player.value;
   if (!element) return;
-  if (element.readyState) element.currentTime = time;
+  if (element.readyState) seek(time);
   else
     element.addEventListener(
       'loadedmetadata',
       () => {
-        element.currentTime = time;
+        if (player.value === element) seek(time);
       },
       { once: true },
     );
-  element.focus({ preventScroll: true });
+}
+
+function syncPlayer(event: Event) {
+  const element = event.currentTarget as HTMLVideoElement;
+  if (!isStagePlayer(element)) return;
+  playing.value = !element.paused && !element.ended;
+  if (previewMode.value === 'source') position.value = element.currentTime;
+  else if (syncOutputProgress(element)) return;
+  if (event.type === 'playing') {
+    videoAdvancing = true;
+    updateMusicPreview();
+  } else if (
+    ['ended', 'error', 'pause', 'seeking', 'waiting'].includes(event.type)
+  ) {
+    stopMusicPreview();
+  } else {
+    syncMusic();
+  }
+}
+
+function playerLoaded(event: Event) {
+  const element = event.currentTarget as HTMLVideoElement;
+  if (!isStagePlayer(element)) return;
+  playbackError.value = false;
+  playerReady.value = true;
+  element.volume = project.value.mix.sourceVolume;
+  if (previewMode.value === 'output') positionOutputPlayer(element);
+  else if (position.value > 0)
+    element.currentTime = Math.min(position.value, element.duration);
+  syncPlayer(event);
+}
+
+function isStagePlayer(element: HTMLVideoElement) {
+  return (
+    element === player.value && element.dataset.previewKey === stageKey.value
+  );
+}
+
+function playerFailed(event: Event) {
+  const element = event.currentTarget as HTMLVideoElement;
+  if (!isStagePlayer(element)) return;
+  playbackError.value = true;
+  outputPlayRequested.value = false;
+  syncPlayer(event);
+}
+
+function seek(time: number) {
+  const element = player.value;
+  if (!element?.readyState || !active.value) return;
+  element.pause();
+  stopMusicPreview();
+  element.currentTime = Math.max(
+    0,
+    Math.min(time, element.duration, active.value.duration),
+  );
+  position.value = element.currentTime;
+}
+
+function stepFrame(direction: number) {
+  const video = active.value;
+  const element = player.value;
+  if (!canPlay.value || !video?.fps || !element) return;
+  const { fps } = video;
+  const duration = Math.min(element.duration, video.duration);
+  const last = Math.max(0, Math.ceil(duration * fps) - 1);
+  const current = Math.min(last, Math.floor(element.currentTime * fps + 0.001));
+  const next = Math.max(0, Math.min(last, current + direction));
+  if (next === current) {
+    element.pause();
+  } else {
+    seek((next + 0.5) / fps);
+  }
+}
+
+function togglePlayback() {
+  const element = player.value;
+  if (previewMode.value === 'output') {
+    if (outputPlayRequested.value) {
+      outputPlayRequested.value = false;
+      element?.pause();
+      stopMusicPreview();
+    } else if (element && canPlay.value) {
+      if (outputPreviewPosition.value >= outputTimeline.value.duration)
+        seekOutputPreview(0, true);
+      else {
+        outputPlayRequested.value = true;
+        playElement(element);
+      }
+    }
+    return;
+  }
+  if (!element || !canPlay.value) return;
+  if (element.paused) {
+    playElement(element);
+  } else element.pause();
+}
+
+function playElement(element: HTMLVideoElement) {
+  void element.play().catch((error) => {
+    if (!isStagePlayer(element) || error.name === 'AbortError') return;
+    outputPlayRequested.value = false;
+    message.error(errorText(error));
+  });
+}
+
+function syncOutputProgress(element: HTMLVideoElement) {
+  const clip = outputPreviewClip.value;
+  if (!clip || !outputPlayRequested.value || element.seeking) return false;
+  const time = clip.outputStart + Math.max(0, element.currentTime - clip.start);
+  if (element.ended || time >= clip.outputEnd - 0.000001) {
+    if (clip.outputEnd < outputTimeline.value.duration) {
+      seekOutputPreview(clip.outputEnd, true);
+    } else {
+      outputPreviewPosition.value = outputTimeline.value.duration;
+      outputPlayRequested.value = false;
+      playing.value = false;
+      element.pause();
+      stopMusicPreview();
+    }
+    return true;
+  }
+  outputPreviewPosition.value = time;
+  return false;
+}
+
+function positionOutputPlayer(element: HTMLVideoElement) {
+  const clip = outputPreviewClip.value;
+  if (!clip) return;
+  const offset = Math.min(
+    Math.max(0, clip.outputEnd - clip.outputStart - 0.001),
+    Math.max(0, outputPreviewPosition.value - clip.outputStart),
+  );
+  element.currentTime = Math.min(element.duration, clip.start + offset);
+  if (outputPlayRequested.value) playElement(element);
+}
+
+function seekOutputPreview(time: number, play = false) {
+  if (previewMode.value !== 'output' || !Number.isFinite(time)) return;
+  const duration = outputTimeline.value.duration;
+  const element = player.value;
+  element?.pause();
+  stopMusicPreview();
+  outputPreviewPosition.value = Math.max(0, Math.min(time, duration));
+  playing.value = false;
+  outputPlayRequested.value = play && !!stageVideo.value?.url;
+  if (element?.readyState && isStagePlayer(element) && !playbackError.value)
+    positionOutputPlayer(element);
+  else if (!element || !isStagePlayer(element)) {
+    playbackError.value = false;
+    playerReady.value = false;
+  } else if (playbackError.value) outputPlayRequested.value = false;
+}
+
+function setPreviewMode(mode: 'output' | 'source') {
+  if (mode === previewMode.value) return;
+  player.value?.pause();
+  stopMusicPreview();
+  previewMode.value = mode;
+  playing.value = false;
+  playerReady.value = false;
+  playbackError.value = false;
+  outputPlayRequested.value = false;
+  if (mode === 'output') outputPreviewPosition.value = 0;
+}
+
+watch(outputPlanKey, () => seekOutputPreview(0));
+watch(stageKey, () => {
+  playerReady.value = false;
+  playbackError.value = false;
+});
+
+function stopMusicPreview() {
+  videoAdvancing = false;
+  cancelAnimationFrame(musicFrame);
+  musicFrame = 0;
+  musicPlayer.value?.pause();
+}
+
+function syncMusic() {
+  const element = musicPlayer.value;
+  const video = player.value;
+  if (
+    !element?.readyState ||
+    !video ||
+    !project.value.music ||
+    previewMode.value !== 'output'
+  )
+    return;
+  const { musicStart, musicVolume } = project.value.mix;
+  const time = outputPreviewPosition.value - musicStart;
+  if (
+    time < 0 ||
+    time >= Math.min(element.duration, project.value.music.duration) ||
+    musicVolume === 0
+  ) {
+    element.pause();
+    return;
+  }
+  if (Math.abs(element.currentTime - time) > 0.1) element.currentTime = time;
+  if (
+    videoAdvancing &&
+    !video.paused &&
+    !video.seeking &&
+    !preview.value &&
+    !musicPlaybackError.value
+  ) {
+    if (element.paused)
+      void element.play().catch((error) => {
+        if (musicPlayer.value === element && error.name !== 'AbortError')
+          musicPlaybackError.value = true;
+      });
+  } else element.pause();
+}
+
+function updateMusicPreview() {
+  if (musicFrame || previewMode.value !== 'output') return;
+  const tick = () => {
+    musicFrame = 0;
+    const element = player.value;
+    if (!videoAdvancing || !element || !isStagePlayer(element)) return;
+    if (syncOutputProgress(element)) return;
+    syncMusic();
+    if (videoAdvancing) musicFrame = requestAnimationFrame(tick);
+  };
+  musicFrame = requestAnimationFrame(tick);
+}
+
+watch(
+  () => project.value.music?.url,
+  () => {
+    musicPlaybackError.value = false;
+    if (videoAdvancing) updateMusicPreview();
+  },
+  { flush: 'post' },
+);
+
+watch([player, () => project.value.mix.sourceVolume], ([element, value]) => {
+  if (element) element.volume = value;
+});
+
+watch(
+  [musicPlayer, () => project.value.mix.musicVolume],
+  ([element, value]) => {
+    if (element) element.volume = value;
+  },
+);
+
+watch([() => project.value.mix.musicStart, outputTimeline], syncMusic);
+watch(preview, (result) => {
+  resultPlaybackError.value = false;
+  if (result) {
+    outputPlayRequested.value = false;
+    player.value?.pause();
+    stopMusicPreview();
+  }
+});
+
+function setMix(key: keyof Mix, value: number) {
+  project.value.mix = { ...project.value.mix, [key]: value };
+}
+
+async function saveMix(key: keyof Mix, value: number) {
+  if (!desktop || locked.value) return;
+  setMix(key, value);
+  if (key !== 'musicStart' && value > 0) previousLevels[key] = value;
+  cleanup.value = [];
+  pendingSettings.value += 1;
+  try {
+    await desktop.update({ mix: { ...project.value.mix } });
+  } catch (error) {
+    message.error(errorText(error));
+  } finally {
+    pendingSettings.value -= 1;
+  }
+}
+
+function muteMix(key: 'musicVolume' | 'sourceVolume') {
+  const value = project.value.mix[key];
+  if (value > 0) previousLevels[key] = value;
+  void saveMix(key, value > 0 ? 0 : previousLevels[key]);
+}
+
+function chooseMusic(remove = false) {
+  if (!desktop || locked.value) return;
+  const api = desktop;
+  outputPlayRequested.value = false;
+  player.value?.pause();
+  stopMusicPreview();
+  void action(async () => {
+    const state = await api.music(remove);
+    if (state) {
+      applyProject(state.project);
+      cleanup.value = state.cleanup;
+    }
+  });
+}
+
+function fullscreen() {
+  const element = stage.value;
+  if (!element) return;
+  const operation = document.fullscreenElement
+    ? document.exitFullscreen()
+    : element.requestFullscreen();
+  void operation.catch((error) => message.error(errorText(error)));
 }
 
 function quickMark() {
@@ -542,7 +942,7 @@ function recycle() {
             <h2 id="materials-title">源素材</h2>
             <Tag>{{ project.videos.length }} 条</Tag>
           </div>
-          <Space wrap class="import-actions">
+          <div class="import-actions">
             <Button
               type="primary"
               :disabled="!desktop || locked"
@@ -556,59 +956,65 @@ function recycle() {
             >
               <template #icon><FolderSearch /></template>扫描目录
             </Button>
-          </Space>
-          <Table
+          </div>
+          <div
             v-if="project.videos.length"
-            :columns="columns"
-            :data-source="project.videos"
-            :pagination="false"
-            :scroll="{ y: 425 }"
-            row-key="id"
-            size="small"
-            table-layout="fixed"
-            :row-class-name="
-              (row: Video) => (row.id === selected ? 'selected-row' : '')
-            "
+            class="materials-list"
+            role="region"
+            aria-label="素材列表"
+            tabindex="0"
           >
-            <template #bodyCell="{ column, record }">
-              <template v-if="column.key === 'source'">
-                <Button
-                  type="link"
-                  class="source-name"
-                  :title="record.path"
-                  @click="selectVideo(record.id)"
-                >
-                  {{ record.name }}
-                </Button>
-                <div class="source-meta">
-                  {{
-                    record.error
-                      ? '素材不可用'
-                      : `${formatTimestamp(record.duration)} · ${record.width}×${record.height}`
-                  }}
-                </div>
+            <Table
+              :columns="columns"
+              :data-source="project.videos"
+              :pagination="false"
+              row-key="id"
+              size="small"
+              table-layout="fixed"
+              :row-class-name="
+                (row: Video) => (row.id === selected ? 'selected-row' : '')
+              "
+            >
+              <template #bodyCell="{ column, record }">
+                <template v-if="column.key === 'source'">
+                  <Button
+                    type="link"
+                    class="source-name"
+                    :title="record.path"
+                    @click="selectVideo(record.id)"
+                  >
+                    {{ record.name }}
+                  </Button>
+                  <div class="source-meta">
+                    {{
+                      record.error
+                        ? '素材不可用'
+                        : `${formatTimestamp(record.duration)} · ${record.width}×${record.height}`
+                    }}
+                  </div>
+                </template>
+                <template v-if="column.key === 'status'">
+                  <Tag
+                    :color="
+                      record.error
+                        ? 'error'
+                        : record.marks.length
+                          ? 'processing'
+                          : 'default'
+                    "
+                  >
+                    {{
+                      record.error
+                        ? '异常'
+                        : record.marks.length
+                          ? `${record.marks.length} 点`
+                          : '未标记'
+                    }}
+                  </Tag>
+                </template>
               </template>
-              <template v-if="column.key === 'status'">
-                <Tag
-                  :color="
-                    record.error
-                      ? 'error'
-                      : record.marks.length
-                        ? 'processing'
-                        : 'default'
-                  "
-                >
-                  {{
-                    record.error
-                      ? '异常'
-                      : record.marks.length
-                        ? `${record.marks.length} 点`
-                        : '未标记'
-                  }}
-                </Tag>
-              </template>
-            </template>
-          </Table>
+            </Table>
+          </div>
           <Empty
             v-else
             :image="Empty.PRESENTED_IMAGE_SIMPLE"
@@ -617,37 +1023,143 @@ function recycle() {
         </section>
 
         <section class="viewer" aria-labelledby="viewer-title">
-          <div class="section-head">
-            <h2 id="viewer-title">素材预览</h2>
-            <span v-if="active?.fps" class="muted">{{ active.fps }} fps</span>
+          <div class="section-head preview-head">
+            <h2 id="viewer-title" class="sr-only">预览</h2>
+            <Segmented
+              :value="previewMode"
+              :options="previewModes"
+              @change="
+                (value) =>
+                  setPreviewMode(value === 'output' ? 'output' : 'source')
+              "
+            />
+            <span v-if="previewMode === 'source' && active?.fps" class="muted">
+              {{ active.fps }} fps
+            </span>
+            <Tag v-else-if="previewMode === 'output'">导出前</Tag>
           </div>
-          <div class="video-stage" :style="{ aspectRatio: videoAspectRatio }">
+          <div
+            ref="stage"
+            class="video-stage"
+            :style="{ aspectRatio: videoAspectRatio }"
+          >
             <video
-              v-if="active?.url"
-              :key="active.url"
+              v-if="stageVideo?.url"
+              :key="stageKey"
               ref="player"
-              controls
-              preload="metadata"
-              tabindex="0"
-              :src="active.url"
-              @timeupdate="position = player?.currentTime ?? 0"
-              @error="playbackError = true"
+              :data-preview-key="stageKey"
+              :preload="previewMode === 'output' ? 'auto' : 'metadata'"
+              playsinline
+              :src="stageVideo.url"
+              @click="togglePlayback"
+              @loadedmetadata="playerLoaded"
+              @timeupdate="syncPlayer"
+              @seeking="syncPlayer"
+              @seeked="syncPlayer"
+              @play="syncPlayer"
+              @playing="syncPlayer"
+              @waiting="syncPlayer"
+              @pause="syncPlayer"
+              @ended="syncPlayer"
+              @error="playerFailed"
             ></video>
             <div v-else class="video-empty">
-              <Film /><span>{{ active ? '素材不可预览' : '未选择视频' }}</span>
+              <Film />
+              <span>{{
+                previewMode === 'output'
+                  ? outputPreviewClip
+                    ? '当前片段不可预览'
+                    : '暂无剪辑片段'
+                  : active
+                    ? '素材不可预览'
+                    : '未选择视频'
+              }}</span>
             </div>
           </div>
-          <div class="transport">
-            <span class="time">{{ formatTimestamp(position) }}
-              <span class="muted">/ {{ formatTimestamp(active?.duration ?? 0) }}</span></span>
-            <Button
-              :disabled="!active?.url || playbackError || locked"
-              @click="quickMark"
+          <Timeline
+            v-if="previewMode === 'source' && active?.url"
+            :video="active"
+            :position="position"
+            :playing="playing"
+            :volume="project.mix.sourceVolume"
+            :mix-disabled="!desktop || locked"
+            :ready="canPlay"
+            :mark-disabled="!canPlay || locked"
+            :ranges="activeRanges"
+            @seek="seek"
+            @step="stepFrame"
+            @toggle="togglePlayback"
+            @mute="muteMix('sourceVolume')"
+            @volume="setMix('sourceVolume', $event)"
+            @save-volume="saveMix('sourceVolume', $event)"
+            @mark="quickMark"
+            @fullscreen="fullscreen"
+          />
+          <div v-if="previewMode === 'output'" class="output-transport">
+            <Tooltip :title="outputPlayRequested ? '暂停成片' : '播放成片'">
+              <Button
+                size="small"
+                :aria-label="outputPlayRequested ? '暂停成片' : '播放成片'"
+                :disabled="!canPlay && !outputPlayRequested"
+                @click="togglePlayback"
+              >
+                <template #icon>
+                  <Pause v-if="outputPlayRequested" /><Play v-else />
+                </template>
+              </Button>
+            </Tooltip>
+            <span class="time">
+              {{ formatTimestamp(outputPreviewPosition) }} /
+              {{ formatTimestamp(outputTimeline.duration) }}
+            </span>
+            <span
+              class="output-current muted"
+              :title="outputPreviewClip?.videoName"
             >
-              <template #icon><Crosshair /></template>标记当前位置
-            </Button>
+              {{ outputPreviewClip?.videoName }}
+            </span>
+            <Tooltip title="全屏预览">
+              <Button
+                size="small"
+                type="text"
+                aria-label="全屏预览"
+                :disabled="!canPlay"
+                @click="fullscreen"
+              >
+                <template #icon><Fullscreen /></template>
+              </Button>
+            </Tooltip>
           </div>
-          <div v-if="active" class="source-details">
+          <MusicTimeline
+            v-if="previewMode === 'output'"
+            :clips="outputTimeline.clips"
+            :duration="outputTimeline.duration"
+            :position="outputPreviewPosition"
+            :music="project.music"
+            :mix="project.mix"
+            :disabled="!desktop || locked"
+            :playback-error="musicPlaybackError"
+            @choose="chooseMusic()"
+            @remove="chooseMusic(true)"
+            @seek="seekOutputPreview"
+            @start="saveMix('musicStart', $event)"
+            @mute="muteMix('musicVolume')"
+            @volume="setMix('musicVolume', $event)"
+            @save-volume="saveMix('musicVolume', $event)"
+            @mute-source="muteMix('sourceVolume')"
+            @source-volume="setMix('sourceVolume', $event)"
+            @save-source-volume="saveMix('sourceVolume', $event)"
+          />
+          <audio
+            v-if="project.music?.url"
+            :key="project.music.url"
+            ref="musicPlayer"
+            :src="project.music.url"
+            preload="auto"
+            @loadedmetadata="syncMusic"
+            @error="musicPlaybackError = true"
+          ></audio>
+          <div v-if="previewMode === 'source' && active" class="source-details">
             <span :title="active.path">{{ active.path }}</span>
             <Space :size="4">
               <Tooltip title="重新定位">
@@ -673,11 +1185,14 @@ function recycle() {
             </Space>
           </div>
           <Alert
-            v-if="active?.error || playbackError"
+            v-if="(previewMode === 'source' && active?.error) || playbackError"
             type="warning"
             show-icon
             :message="
-              active?.error || '播放器无法打开此编码，仍可用时间戳标记和导出。'
+              previewMode === 'output'
+                ? '当前片段无法播放。可在时间轴选择其他片段，或导出后查看成片。'
+                : active?.error ||
+                  '播放器无法打开此编码，仍可用时间戳标记和导出。'
             "
           />
         </section>
@@ -1028,7 +1543,7 @@ function recycle() {
                   >{{ volume.width }}×{{ volume.height }}</span>
                 <span class="time">{{ formatTimestamp(volume.duration) }}</span>
                 <Button v-if="volume.url" type="link" @click="preview = volume">
-                  播放成片
+                  查看已导出成片
                 </Button>
                 <span
                   v-if="volume.detail"
@@ -1117,7 +1632,14 @@ function recycle() {
         class="result-player"
         controls
         autoplay
+        @error="resultPlaybackError = true"
       ></video>
+      <Alert
+        v-if="resultPlaybackError"
+        type="warning"
+        show-icon
+        message="无法播放此导出文件。请在输出目录确认文件是否仍然存在。"
+      />
     </Modal>
     <div v-if="busy" class="busy-indicator" role="status" aria-label="处理中">
       <Spin size="small" />
@@ -1227,6 +1749,7 @@ h1 {
 
 .editor > * {
   min-width: 0;
+  min-height: 0;
   padding: 16px;
 }
 
@@ -1251,12 +1774,34 @@ h2 {
   margin-inline-end: 0;
 }
 
+.materials {
+  display: grid;
+  grid-template-rows: max-content max-content minmax(min(240px, 38vh), 1fr);
+}
+
 .import-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
   margin-bottom: 12px;
 }
 
-.materials :deep(.ant-table-wrapper) {
-  margin-top: 12px;
+.materials-list {
+  /* The preview and settings determine the row height, not the file count. */
+  contain: size;
+  overflow: auto;
+  scrollbar-gutter: stable;
+}
+
+.materials-list:focus-visible {
+  outline: 2px solid hsl(var(--primary));
+  outline-offset: -2px;
+}
+
+.materials-list :deep(.ant-table-thead > tr > th) {
+  position: sticky;
+  top: 0;
+  z-index: 1;
 }
 
 .materials.dragging {
@@ -1286,7 +1831,9 @@ h2 {
 .video-stage {
   display: grid;
   place-items: center;
+  width: 100%;
   min-height: 160px;
+  max-height: max(160px, 51vh);
   overflow: hidden;
   background: #15181d;
   border-radius: 6px;
@@ -1295,9 +1842,37 @@ h2 {
 .video-stage video {
   display: block;
   width: 100%;
-  height: auto;
-  max-height: 58vh;
+  height: 100%;
+  min-height: 0;
   object-fit: contain;
+}
+
+.video-stage:fullscreen {
+  max-height: none;
+  background: #000;
+  border-radius: 0;
+}
+
+.preview-head,
+.output-transport {
+  flex-wrap: wrap;
+}
+
+.output-transport {
+  display: flex;
+  gap: 6px 10px;
+  align-items: center;
+  min-height: 36px;
+  margin-top: 6px;
+  font-size: 12px;
+}
+
+.output-current {
+  flex: 1 1 90px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .video-empty {
@@ -1321,7 +1896,6 @@ h2 {
   color: hsl(var(--muted-foreground));
 }
 
-.transport,
 .source-details {
   display: flex;
   gap: 8px;
@@ -1406,7 +1980,7 @@ h2 {
 
 .resolution-hint {
   display: block;
-  margin-top: -6px;
+  margin-top: 4px;
   font-size: 11px;
   line-height: 16px;
   color: hsl(var(--muted-foreground));
@@ -1546,6 +2120,15 @@ h2 {
     border-left: 0;
   }
 
+  .materials-list {
+    max-block-size: min(40vh, 360px);
+    contain: none;
+  }
+
+  .materials {
+    grid-template-rows: max-content max-content auto;
+  }
+
   .settings {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
@@ -1556,10 +2139,6 @@ h2 {
 
   .result-row {
     grid-template-columns: minmax(0, 1fr) max-content;
-  }
-
-  .transport {
-    flex-wrap: wrap;
   }
 }
 </style>

@@ -7,8 +7,29 @@ export interface Video extends VideoForPlan {
   width: number;
   height: number;
   fps: number;
+  hasAudio: boolean;
   error: string;
   url: string;
+}
+
+export interface Waveform {
+  peaks: number[];
+  secondsPerPeak: number;
+}
+
+export interface Music {
+  id: string;
+  name: string;
+  path: string;
+  duration: number;
+  url: string;
+  error: string;
+}
+
+export interface Mix {
+  sourceVolume: number;
+  musicVolume: number;
+  musicStart: number;
 }
 
 export interface Settings extends ClipSettings {
@@ -34,13 +55,20 @@ export interface RenderResult {
 
 export interface Project {
   name: string;
+  createdAt?: string;
   videos: Video[];
   settings: Settings;
+  mix: Mix;
+  music: Music | null;
   outputDirectory: string;
   result: null | RenderResult;
 }
 
 type ProjectState = { project: Project; projectFile?: string };
+type RestoredProjectState = ProjectState & {
+  cleanup: Video[];
+  saveState: SaveState;
+};
 
 export interface SaveState {
   status: 'restore-failed' | 'save-failed' | 'saved' | 'saving' | 'unsaved';
@@ -54,20 +82,24 @@ export interface ImportProgress {
 }
 
 interface Desktop {
-  project(): Promise<ProjectState & { cleanup: Video[]; saveState: SaveState }>;
+  project(): Promise<RestoredProjectState>;
   newProject(name: string): Promise<ProjectState>;
-  openProject(): Promise<null | ProjectState>;
+  openProject(): Promise<null | RestoredProjectState>;
   saveProject(): Promise<null | string>;
   retrySave(): Promise<void>;
   update(data: {
     settings?: Settings;
     marks?: { id: string; values: number[] };
     remove?: string;
+    mix?: Mix;
   }): Promise<void>;
   importFiles(): Promise<Project>;
   importDirectory(): Promise<Project>;
   importDrop(files: File[]): Promise<Project>;
   locate(id: string): Promise<Project>;
+  music(remove: boolean): Promise<null | RestoredProjectState>;
+  waveform(id: string, url: string): Promise<null | Waveform>;
+  cancelWaveform(url: string): Promise<void>;
   outputDirectory(): Promise<null | string>;
   startExport(): Promise<{ result: RenderResult }>;
   waitExport(): Promise<RenderResult>;
@@ -85,6 +117,11 @@ interface Desktop {
 
 export const desktop = (window as Window & { clipWorkbench?: Desktop })
   .clipWorkbench;
+export const initialMix: Mix = {
+  sourceVolume: 1,
+  musicVolume: 0.25,
+  musicStart: 0,
+};
 export const initialSettings: Settings = {
   preRollSeconds: 5,
   postRollSeconds: 5,

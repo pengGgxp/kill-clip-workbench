@@ -1,4 +1,6 @@
 <script lang="ts" setup>
+import type { ComponentPublicInstance } from 'vue';
+
 import type {
   ImportProgress,
   Mix,
@@ -9,7 +11,15 @@ import type {
   Video,
 } from './desktop';
 
-import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue';
+import {
+  computed,
+  nextTick,
+  onMounted,
+  onUnmounted,
+  ref,
+  shallowReactive,
+  watch,
+} from 'vue';
 
 import {
   Clapperboard,
@@ -76,7 +86,18 @@ const project = ref<Project>({
 const projectFile = ref<string>();
 const cleanup = ref<Video[]>([]);
 const selected = ref('');
-const player = ref<HTMLVideoElement>();
+const sourcePlayer = ref<HTMLVideoElement>();
+const outputPlayers = shallowReactive<Array<HTMLVideoElement | undefined>>([]);
+const outputSlots = ref<Array<undefined | { url: string; time: number }>>([]);
+const outputSlot = ref(0);
+const outputPlayerRefs = [0, 1].map(
+  (slot) => (element: ComponentPublicInstance | Element | null) => {
+    bindOutputPlayer(
+      slot,
+      element instanceof HTMLVideoElement ? element : null,
+    );
+  },
+);
 const stage = ref<HTMLElement>();
 const musicPlayer = ref<HTMLAudioElement>();
 const musicPlaybackError = ref(false);
@@ -93,6 +114,11 @@ const playbackError = ref(false);
 const previewMode = ref<'output' | 'source'>('source');
 const outputPreviewPosition = ref(0);
 const outputPlayRequested = ref(false);
+const player = computed(() =>
+  previewMode.value === 'output'
+    ? outputPlayers[outputSlot.value]
+    : sourcePlayer.value,
+);
 const draft = ref('');
 const inputError = ref('');
 const edit = ref<number>();
@@ -189,11 +215,12 @@ function outputClipAt(time: number) {
 const outputPreviewClip = computed(() =>
   outputClipAt(outputPreviewPosition.value),
 );
+const videosById = computed(
+  () => new Map(project.value.videos.map((video) => [video.id, video])),
+);
 const stageVideo = computed(() =>
   previewMode.value === 'output'
-    ? project.value.videos.find(
-        ({ id }) => id === outputPreviewClip.value?.videoId,
-      )
+    ? videosById.value.get(outputPreviewClip.value?.videoId ?? '')
     : active.value,
 );
 const stageDimensions = computed(() => {
@@ -203,11 +230,8 @@ const stageDimensions = computed(() => {
   );
   const firstClip =
     volumeStart === undefined ? undefined : outputClipAt(volumeStart);
-  return project.value.videos.find(({ id }) => id === firstClip?.videoId);
+  return videosById.value.get(firstClip?.videoId ?? '');
 });
-const stageKey = computed(
-  () => `${previewMode.value}:${stageVideo.value?.url ?? ''}`,
-);
 const outputPlanKey = computed(() =>
   JSON.stringify(
     outputTimeline.value.clips.map(({ videoId, start, outputEnd }) => [
@@ -488,7 +512,7 @@ function syncPlayer(event: Event) {
   if (!isStagePlayer(element)) return;
   playing.value = !element.paused && !element.ended;
   if (previewMode.value === 'source') position.value = element.currentTime;
-  else if (syncOutputProgress(element)) return;
+  else if (event.type !== 'error' && syncOutputProgress(element)) return;
   if (event.type === 'playing') {
     videoAdvancing = true;
     updateMusicPreview();
@@ -501,25 +525,33 @@ function syncPlayer(event: Event) {
   }
 }
 
-function playerLoaded(event: Event) {
+function sourceLoaded(event: Event) {
   const element = event.currentTarget as HTMLVideoElement;
   if (!isStagePlayer(element)) return;
   playbackError.value = false;
   playerReady.value = true;
   element.volume = project.value.mix.sourceVolume;
-  if (previewMode.value === 'output') positionOutputPlayer(element);
-  else if (position.value > 0)
+  if (position.value > 0)
     element.currentTime = Math.min(position.value, element.duration);
   syncPlayer(event);
 }
 
 function isStagePlayer(element: HTMLVideoElement) {
   return (
-    element === player.value && element.dataset.previewKey === stageKey.value
+    element === player.value &&
+    element.getAttribute('src') === stageVideo.value?.url
   );
 }
 
 function playerFailed(event: Event) {
+  const element = event.currentTarget as HTMLVideoElement;
+  if (!isStagePlayer(element)) return;
+  playbackError.value = true;
+  outputPlayRequested.value = false;
+  syncPlayer(event);
+}
+
+function outputPlayerFailed(event: Event) {
   const element = event.currentTarget as HTMLVideoElement;
   if (!isStagePlayer(element)) return;
   playbackError.value = true;
@@ -602,36 +634,94 @@ function syncOutputProgress(element: HTMLVideoElement) {
     }
     return true;
   }
-  outputPreviewPosition.value = time;
+  if (time - outputPreviewPosition.value >= 0.08)
+    outputPreviewPosition.value = time;
   return false;
 }
 
-function positionOutputPlayer(element: HTMLVideoElement) {
-  const clip = outputPreviewClip.value;
-  if (!clip) return;
-  const offset = Math.min(
-    Math.max(0, clip.outputEnd - clip.outputStart - 0.001),
-    Math.max(0, outputPreviewPosition.value - clip.outputStart),
-  );
-  element.currentTime = Math.min(element.duration, clip.start + offset);
+function bindOutputPlayer(slot: number, element: HTMLVideoElement | null) {
+  outputPlayers[slot] = element ?? undefined;
+}
+
+function positionOutputPlayer(slot: number) {
+  const element = outputPlayers[slot];
+  const target = outputSlots.value[slot];
+  if (
+    !target ||
+    !element?.readyState ||
+    element.error ||
+    element.getAttribute('src') !== target.url
+  )
+    return;
+  const time = Math.min(element.duration, target.time);
+  if (Math.abs(element.currentTime - time) > 0.001) element.currentTime = time;
+  if (slot !== outputSlot.value) return;
+  element.volume = project.value.mix.sourceVolume;
+  playerReady.value = true;
   if (outputPlayRequested.value) playElement(element);
+}
+
+function prepareOutputPlayer(slot: number, url: string | undefined, time = 0) {
+  const previous = outputSlots.value[slot];
+  if (url === previous?.url && time === previous?.time) return;
+  outputSlots.value[slot] = url ? { url, time } : undefined;
+  if (url === previous?.url) positionOutputPlayer(slot);
 }
 
 function seekOutputPreview(time: number, play = false) {
   if (previewMode.value !== 'output' || !Number.isFinite(time)) return;
-  const duration = outputTimeline.value.duration;
+  const target = Math.max(0, Math.min(time, outputTimeline.value.duration));
+  const clip = outputClipAt(target);
+  const url = videosById.value.get(clip?.videoId ?? '')?.url;
+  const sourceTime = clip
+    ? clip.start +
+      Math.min(
+        Math.max(0, clip.outputEnd - clip.outputStart - 0.001),
+        target - clip.outputStart,
+      )
+    : 0;
   const element = player.value;
+  const standby = 1 - outputSlot.value;
+  const buffered = outputPlayers[standby];
+  const prepared = outputSlots.value[standby];
+  const bufferedAtTarget =
+    !!buffered &&
+    buffered.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA &&
+    !buffered.seeking &&
+    Math.abs(buffered.currentTime - sourceTime) <= 0.001;
+  const currentMatches = element?.getAttribute('src') === url;
+  const useStandby =
+    !!url &&
+    prepared?.url === url &&
+    !buffered?.error &&
+    (!currentMatches || bufferedAtTarget);
+  const ready = useStandby && bufferedAtTarget;
+
+  if (!play || !ready) stopMusicPreview();
+  if (useStandby) outputSlot.value = standby;
   element?.pause();
-  stopMusicPreview();
-  outputPreviewPosition.value = Math.max(0, Math.min(time, duration));
-  playing.value = false;
-  outputPlayRequested.value = play && !!stageVideo.value?.url;
-  if (element?.readyState && isStagePlayer(element) && !playbackError.value)
-    positionOutputPlayer(element);
-  else if (!element || !isStagePlayer(element)) {
-    playbackError.value = false;
-    playerReady.value = false;
-  } else if (playbackError.value) outputPlayRequested.value = false;
+  outputPreviewPosition.value = target;
+  outputPlayRequested.value = play && !!url;
+  playing.value = play && ready;
+  const current = player.value;
+  const sameSource = !!url && current?.getAttribute('src') === url;
+  playbackError.value = sameSource && !!current?.error;
+  playerReady.value = sameSource && !!current?.readyState;
+  if (playbackError.value) outputPlayRequested.value = false;
+  if (url && current && !sameSource) current.pause();
+  prepareOutputPlayer(outputSlot.value, url, sourceTime);
+  if (sameSource && outputSlots.value[outputSlot.value]?.time === sourceTime)
+    positionOutputPlayer(outputSlot.value);
+
+  const next =
+    clip && clip.outputEnd < outputTimeline.value.duration
+      ? outputClipAt(clip.outputEnd)
+      : undefined;
+  prepareOutputPlayer(
+    1 - outputSlot.value,
+    videosById.value.get(next?.videoId ?? '')?.url,
+    next?.start,
+  );
 }
 
 function setPreviewMode(mode: 'output' | 'source') {
@@ -643,14 +733,19 @@ function setPreviewMode(mode: 'output' | 'source') {
   playerReady.value = false;
   playbackError.value = false;
   outputPlayRequested.value = false;
-  if (mode === 'output') outputPreviewPosition.value = 0;
+  if (mode === 'output') seekOutputPreview(0);
+  else outputSlots.value = [];
 }
 
 watch(outputPlanKey, () => seekOutputPreview(0));
-watch(stageKey, () => {
-  playerReady.value = false;
-  playbackError.value = false;
-});
+watch(
+  () => active.value?.url,
+  () => {
+    if (previewMode.value !== 'source') return;
+    playerReady.value = false;
+    playbackError.value = false;
+  },
+);
 
 function stopMusicPreview() {
   videoAdvancing = false;
@@ -659,7 +754,7 @@ function stopMusicPreview() {
   musicPlayer.value?.pause();
 }
 
-function syncMusic() {
+function syncMusic(outputTime = outputPreviewPosition.value) {
   const element = musicPlayer.value;
   const video = player.value;
   if (
@@ -670,7 +765,7 @@ function syncMusic() {
   )
     return;
   const { musicStart, musicVolume } = project.value.mix;
-  const time = outputPreviewPosition.value - musicStart;
+  const time = outputTime - musicStart;
   if (
     time < 0 ||
     time >= Math.min(element.duration, project.value.music.duration) ||
@@ -695,6 +790,10 @@ function syncMusic() {
   } else element.pause();
 }
 
+function musicLoaded() {
+  syncMusic();
+}
+
 function updateMusicPreview() {
   if (musicFrame || previewMode.value !== 'output') return;
   const tick = () => {
@@ -702,7 +801,11 @@ function updateMusicPreview() {
     const element = player.value;
     if (!videoAdvancing || !element || !isStagePlayer(element)) return;
     if (syncOutputProgress(element)) return;
-    syncMusic();
+    const clip = outputPreviewClip.value;
+    if (clip)
+      syncMusic(
+        clip.outputStart + Math.max(0, element.currentTime - clip.start),
+      );
     if (videoAdvancing) musicFrame = requestAnimationFrame(tick);
   };
   musicFrame = requestAnimationFrame(tick);
@@ -728,7 +831,7 @@ watch(
   },
 );
 
-watch([() => project.value.mix.musicStart, outputTimeline], syncMusic);
+watch([() => project.value.mix.musicStart, outputTimeline], () => syncMusic());
 watch(preview, (result) => {
   resultPlaybackError.value = false;
   if (result) {
@@ -1043,38 +1146,60 @@ function recycle() {
             class="video-stage"
             :style="{ aspectRatio: videoAspectRatio }"
           >
-            <video
-              v-if="stageVideo?.url"
-              :key="stageKey"
-              ref="player"
-              :data-preview-key="stageKey"
-              :preload="previewMode === 'output' ? 'auto' : 'metadata'"
-              playsinline
-              :src="stageVideo.url"
-              @click="togglePlayback"
-              @loadedmetadata="playerLoaded"
-              @timeupdate="syncPlayer"
-              @seeking="syncPlayer"
-              @seeked="syncPlayer"
-              @play="syncPlayer"
-              @playing="syncPlayer"
-              @waiting="syncPlayer"
-              @pause="syncPlayer"
-              @ended="syncPlayer"
-              @error="playerFailed"
-            ></video>
-            <div v-else class="video-empty">
-              <Film />
-              <span>{{
-                previewMode === 'output'
-                  ? outputPreviewClip
-                    ? '当前片段不可预览'
-                    : '暂无剪辑片段'
-                  : active
-                    ? '素材不可预览'
-                    : '未选择视频'
-              }}</span>
-            </div>
+            <template v-if="previewMode === 'source'">
+              <video
+                v-if="stageVideo?.url"
+                ref="sourcePlayer"
+                preload="metadata"
+                playsinline
+                :src="stageVideo.url"
+                @click="togglePlayback"
+                @loadedmetadata="sourceLoaded"
+                @timeupdate="syncPlayer"
+                @seeking="syncPlayer"
+                @seeked="syncPlayer"
+                @play="syncPlayer"
+                @playing="syncPlayer"
+                @waiting="syncPlayer"
+                @pause="syncPlayer"
+                @ended="syncPlayer"
+                @error="playerFailed"
+              ></video>
+              <div v-else class="video-empty">
+                <Film />
+                <span>{{ active ? '素材不可预览' : '未选择视频' }}</span>
+              </div>
+            </template>
+            <template v-else>
+              <video
+                v-for="slot in [0, 1]"
+                :key="slot"
+                :ref="outputPlayerRefs[slot]"
+                :class="{ 'output-player-active': outputSlot === slot }"
+                :src="outputSlots[slot]?.url"
+                preload="auto"
+                playsinline
+                @click="togglePlayback"
+                @loadedmetadata="positionOutputPlayer(slot)"
+                @loadeddata="positionOutputPlayer(slot)"
+                @canplay="positionOutputPlayer(slot)"
+                @timeupdate="syncPlayer"
+                @seeking="syncPlayer"
+                @seeked="syncPlayer"
+                @play="syncPlayer"
+                @playing="syncPlayer"
+                @waiting="syncPlayer"
+                @pause="syncPlayer"
+                @ended="syncPlayer"
+                @error="outputPlayerFailed"
+              ></video>
+              <div v-if="!stageVideo?.url" class="video-empty">
+                <Film />
+                <span>{{
+                  outputPreviewClip ? '当前片段不可预览' : '暂无剪辑片段'
+                }}</span>
+              </div>
+            </template>
           </div>
           <Timeline
             v-if="previewMode === 'source' && active?.url"
@@ -1156,7 +1281,7 @@ function recycle() {
             ref="musicPlayer"
             :src="project.music.url"
             preload="auto"
-            @loadedmetadata="syncMusic"
+            @loadedmetadata="musicLoaded"
             @error="musicPlaybackError = true"
           ></audio>
           <div v-if="previewMode === 'source' && active" class="source-details">
@@ -1829,6 +1954,7 @@ h2 {
 }
 
 .video-stage {
+  position: relative;
   display: grid;
   place-items: center;
   width: 100%;
@@ -1845,6 +1971,15 @@ h2 {
   height: 100%;
   min-height: 0;
   object-fit: contain;
+}
+
+.video-stage > video:not(.output-player-active) {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  opacity: 0;
 }
 
 .video-stage:fullscreen {

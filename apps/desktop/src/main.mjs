@@ -55,6 +55,7 @@ const defaults = {
   maxVolumeHours: 1,
   motionBlur: false,
   resolution: 'source',
+  fitMode: 'pad',
 };
 const channels = 'workbench:';
 const defaultMix = { sourceVolume: 1, musicVolume: 0.25, musicStart: 0 };
@@ -220,6 +221,8 @@ function validatedSettings(raw) {
     throw new Error('输出规格无效');
   if (typeof settings.motionBlur !== 'boolean')
     throw new Error('运动模糊设置无效');
+  if (!['crop', 'pad', 'stretch'].includes(settings.fitMode))
+    throw new Error('画面适配设置无效');
   return Object.fromEntries(
     Object.keys(defaults).map((key) => [key, settings[key]]),
   );
@@ -602,6 +605,7 @@ async function exportProject() {
           },
           {
             motionBlur: snapshot.settings.motionBlur,
+            fitMode: snapshot.settings.fitMode,
             sourceVolume: snapshot.mix.sourceVolume,
             musicVolume: snapshot.mix.musicVolume,
             music: snapshot.music && {

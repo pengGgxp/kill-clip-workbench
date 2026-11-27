@@ -11,6 +11,7 @@ import { buildClipPlan, buildOutputTimeline } from './clip-plan.mjs';
 import {
   audioPeaks,
   fileIdentity,
+  fitFilter,
   outputSize,
   probe,
   probeAudio,
@@ -86,6 +87,19 @@ it('uses the first source clip dimensions for each volume in source mode', () =>
   assert.deepEqual(outputSize('source', volume, videos), [1440, 1080]);
   assert.deepEqual(outputSize('720p', volume, videos), [1280, 720]);
   assert.throws(() => outputSize('source', volume, []), /无法确定输出尺寸/);
+});
+
+it('builds distinct fit filters for stretch, crop, and padding', () => {
+  assert.match(fitFilter(1920, 1080, 'stretch'), /^scale=1920:1080,setsar=1,/);
+  assert.match(
+    fitFilter(1920, 1080, 'crop'),
+    /^scale=1920:1080:force_original_aspect_ratio=increase:force_divisible_by=2,crop=1920:1080,setsar=1,/,
+  );
+  assert.match(
+    fitFilter(1920, 1080, 'pad'),
+    /pad=1920:1080:\(ow-iw\)\/2:\(oh-ih\)\/2,/,
+  );
+  assert.equal(fitFilter(1920, 1080), fitFilter(1920, 1080, 'pad'));
 });
 
 it('exports and fully verifies different video specifications within the volume limit', async () => {

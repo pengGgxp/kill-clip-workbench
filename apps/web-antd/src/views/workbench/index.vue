@@ -1462,6 +1462,25 @@ function recycle() {
                 class="resolution-hint"
                 >{{ resolutionHint }}</span>
             </FormItem>
+            <FormItem label="画面适配" html-for="fit-mode" class="resolution">
+              <Select
+                id="fit-mode"
+                :value="project.settings.fitMode"
+                :disabled="!desktop || locked"
+                :options="[
+                  { value: 'stretch', label: '拉伸填满（可能变形）' },
+                  { value: 'crop', label: '裁切填满（保持比例）' },
+                  { value: 'pad', label: '黑边完整画面（保持比例）' },
+                ]"
+                @change="
+                  (value) =>
+                    (value === 'stretch' ||
+                      value === 'crop' ||
+                      value === 'pad') &&
+                    updateSettings('fitMode', value)
+                "
+              />
+            </FormItem>
             <FormItem class="motion-blur">
               <Checkbox
                 :checked="project.settings.motionBlur"

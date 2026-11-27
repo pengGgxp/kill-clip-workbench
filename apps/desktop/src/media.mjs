@@ -109,6 +109,18 @@ export function outputSize(setting, volume, videos) {
   ];
 }
 
+export function fitFilter(width, height, mode = 'pad') {
+  let fit;
+  if (mode === 'stretch') {
+    fit = `scale=${width}:${height},setsar=1`;
+  } else if (mode === 'crop') {
+    fit = `scale=${width}:${height}:force_original_aspect_ratio=increase:force_divisible_by=2,crop=${width}:${height},setsar=1`;
+  } else {
+    fit = `scale=w='if(gte(dar,${width}/${height}),${width},max(2,trunc(${height}*dar/2)*2))':h='if(gte(dar,${width}/${height}),max(2,trunc(${width}/dar/2)*2),${height})',setsar=1,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2`;
+  }
+  return `${fit},fps=${fps},tpad=stop_mode=clone:stop_duration=0.5`;
+}
+
 function startProcess(
   executable,
   args,
@@ -461,6 +473,7 @@ export async function renderVolume(
   progress,
   {
     motionBlur = false,
+    fitMode = 'pad',
     music,
     musicVolume = 0.25,
     sourceVolume = 1,
@@ -492,7 +505,7 @@ export async function renderVolume(
         '-i',
         clip.videoPath,
       ];
-      const filter = `scale=w='if(gte(dar,${width}/${height}),${width},max(2,trunc(${height}*dar/2)*2))':h='if(gte(dar,${width}/${height}),max(2,trunc(${width}/dar/2)*2),${height})',setsar=1,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,fps=${fps},tpad=stop_mode=clone:stop_duration=0.5`;
+      const filter = fitFilter(width, height, fitMode);
       const encoding = [
         '-af',
         'aresample=48000:async=1:first_pts=0,apad',

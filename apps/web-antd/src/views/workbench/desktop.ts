@@ -35,6 +35,7 @@ export interface Mix {
 export interface Settings extends ClipSettings {
   motionBlur: boolean;
   resolution: '720p' | '1080p' | 'source';
+  fitMode: 'crop' | 'pad' | 'stretch';
 }
 
 export interface RenderResult {
@@ -129,4 +130,5 @@ export const initialSettings: Settings = {
   maxVolumeHours: 1,
   motionBlur: false,
   resolution: 'source',
+  fitMode: 'pad',
 };
